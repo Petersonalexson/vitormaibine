@@ -1,0 +1,461 @@
+import pandas as pd
+import numpy as np
+import openpyxl
+from openpyxl.utils.dataframe import dataframe_to_rows
+from datetime import datetime
+import os
+import sys
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import traceback
+
+def process_xav_data(input_file, output_file=None, status_callback=None):
+    """
+    Process XAV Excel file and update the FUTURE sheet.
+    
+    Args:
+        input_file (str): Path to the input Excel file
+        output_file (str, optional): Path to save the output Excel file. 
+                                    If None, will modify the input file name.
+        status_callback (function, optional): Callback function to update status
+    
+    Returns:
+        str: Path to the output file
+    """
+    def update_status(message):
+        if status_callback:
+            status_callback(message)
+        else:
+            print(message)
+    
+    if output_file is None:
+        file_name, file_ext = os.path.splitext(input_file)
+        output_file = f"{file_name} - Processed{file_ext}"
+    
+    update_status(f"Processing {input_file}...")
+    
+    # Load the Excel workbook
+    workbook = openpyxl.load_workbook(input_file)
+    
+    # Check for required sheets
+    required_sheets = ["XAV Extract", "Account Mapping", "Reference Mapping", "FUTURE"]
+    missing_sheets = [sheet for sheet in required_sheets if sheet not in workbook.sheetnames]
+    
+    if missing_sheets:
+        raise ValueError(f"Missing required sheets: {', '.join(missing_sheets)}")
+    
+    # STEP 1: Extract data from the required sheets
+    update_status("Extracting data from required sheets...")
+    
+    # Get XAV Extract data
+    xav_data = pd.read_excel(input_file, sheet_name="XAV Extract")
+    
+    # Get Account Mapping data
+    account_mapping = pd.read_excel(input_file, sheet_name="Account Mapping")
+    
+    # Get Reference Mapping data
+    ref_mapping_raw = pd.read_excel(input_file, sheet_name="Reference Mapping", header=None)
+    
+    # STEP 2: Create the necessary mappings
+    update_status("Creating data mappings...")
+    
+    # Create mapping from Account to Report Description (tag)
+    account_to_tag = {}
+    for _, row in account_mapping.iterrows():
+        if not pd.isna(row.get('Account')) and not pd.isna(row.get('Report Description')):
+            account_to_tag[str(row['Account'])] = row['Report Description']
+    
+    update_status(f"Found {len(account_to_tag)} account to tag mappings")
+    
+    # Create period to month mapping from Reference Mapping
+    # First, find the header row in Reference Mapping
+    period_to_month = {}
+    for i, row in ref_mapping_raw.iterrows():
+        if row.get(5) is not None and row.get(1) is not None:
+            if not pd.isna(row[5]) and not pd.isna(row[1]):
+                period_to_month[row[5]] = row[1]
+    
+    update_status(f"Found {len(period_to_month)} period to month mappings")
+    
+    # Create Report Description to Future Tag mapping
+    tag_to_future_tag = {}
+    
+    # Find the section with "Account Mapping" and "FUTURE" headers
+    for i, row in ref_mapping_raw.iterrows():
+        if (row.get(1) == "Account Mapping" and row.get(2) == "FUTURE"):
+            # Process the rows below until we find a blank
+            j = i + 1
+            while j < len(ref_mapping_raw) and not pd.isna(ref_mapping_raw.iloc[j, 1]):
+                tag_to_future_tag[ref_mapping_raw.iloc[j, 1]] = ref_mapping_raw.iloc[j, 2]
+                j += 1
+            break
+    
+    update_status(f"Found {len(tag_to_future_tag)} tag to future tag mappings")
+    
+    # STEP 3: Process the XAV data
+    update_status("Processing XAV data...")
+    
+    processed_data = []
+    unmapped_accounts = []
+    
+    for _, row in xav_data.iterrows():
+        account = str(row['Nat Account']) if not pd.isna(row.get('Nat Account')) else None
+        cc = str(row['CC']) if not pd.isna(row.get('CC')) else None
+        period = row['Period'] if not pd.isna(row.get('Period')) else None
+        amount = float(row['Amount']) if not pd.isna(row.get('Amount')) else 0
+        
+        # Skip rows with missing required fields
+        if not all([account, cc, period]):
+            continue
+        
+        # Check if account mapping exists
+        if account not in account_to_tag:
+            unmapped_accounts.append({
+                'account': account,
+                'period': period,
+                'cc': cc,
+                'amount': amount
+            })
+            continue  # Skip this row
+        
+        tag = account_to_tag[account]
+        future_tag = tag_to_future_tag.get(tag, tag)  # Use mapped tag or original if not mapped
+        month = period_to_month.get(period, period)  # Use mapped month or original if not mapped
+        
+        processed_data.append({
+            'cc': cc,
+            'tag': future_tag,
+            'period': period,
+            'month': month,
+            'amount': amount
+        })
+    
+    update_status(f"Processed {len(processed_data)} rows of data")
+    
+    if unmapped_accounts:
+        update_status(f"WARNING: Found {len(unmapped_accounts)} unmapped accounts")
+    
+    # STEP 4: Aggregate data by CC, tag, and month
+    update_status("Aggregating data...")
+    
+    # Convert to DataFrame for easier aggregation
+    df_processed = pd.DataFrame(processed_data)
+    
+    # Group by CC, tag, and month and sum the amounts
+    df_aggregated = df_processed.groupby(['cc', 'tag', 'month'])['amount'].sum().reset_index()
+    
+    # STEP 5: Format data for FUTURE sheet
+    update_status("Formatting data for FUTURE sheet...")
+    
+    # Get the FUTURE sheet structure
+    future_sheet = workbook["FUTURE"]
+    
+    # Extract the months from the first row
+    future_months = []
+    for cell in future_sheet[1][3:]:  # Start from column D (index 3)
+        if cell.value:
+            future_months.append(cell.value)
+    
+    update_status(f"Found {len(future_months)} months in FUTURE sheet")
+    
+    # Prepare data for the FUTURE sheet
+    # First, reshape the aggregated data to have months as columns
+    pivot_df = df_aggregated.pivot_table(
+        index=['cc', 'tag'],
+        columns='month',
+        values='amount',
+        aggfunc='sum',
+        fill_value=""
+    ).reset_index()
+    
+    # Format the data for the FUTURE sheet
+    future_rows = []
+    
+    # Group by CC
+    unique_ccs = sorted(df_processed['cc'].unique())
+    
+    for cc in unique_ccs:
+        # Add the CC header row
+        header_row = [cc, "Blabla", "Blabla"] + future_months
+        future_rows.append(header_row)
+        
+        # Get tags for this CC
+        cc_tags = sorted(df_processed[df_processed['cc'] == cc]['tag'].unique())
+        
+        # Add rows for each tag
+        for tag in cc_tags:
+            # Create the row with the tag first
+            tag_row = [tag, None, None]
+            
+            # Add amounts for each month
+            for month in future_months:
+                # Find the amount in the pivot table
+                matching_rows = pivot_df[(pivot_df['cc'] == cc) & (pivot_df['tag'] == tag)]
+                if not matching_rows.empty and month in matching_rows.columns:
+                    amount = matching_rows[month].values[0]
+                    tag_row.append(amount)
+                else:
+                    tag_row.append("")
+            
+            future_rows.append(tag_row)
+        
+        # Add an empty row after each CC section
+        future_rows.append([])
+    
+    # STEP 6: Create or update the LOGS sheet structure
+    
+    # Ensure "LOGS >>" sheet exists (create if not)
+    logs_sheet_name = "LOGS >>"
+    if logs_sheet_name not in workbook.sheetnames:
+        workbook.create_sheet(logs_sheet_name)
+        update_status(f"Created {logs_sheet_name} sheet")
+    
+    # Create or reset FutureLog sheet after "LOGS >>" sheet
+    future_log_name = "FutureLog"
+    if future_log_name in workbook.sheetnames:
+        # Remove existing sheet
+        del workbook[future_log_name]
+    
+    # Create new FutureLog sheet after LOGS >>
+    logs_index = workbook.sheetnames.index(logs_sheet_name)
+    future_log = workbook.create_sheet(future_log_name, logs_index + 1)
+    
+    # Add headers to FutureLog
+    log_headers = [
+        "Timestamp", 
+        "Process Type", 
+        "Accounts Processed", 
+        "Unmapped Accounts", 
+        "CCs Processed", 
+        "Months Processed", 
+        "Status"
+    ]
+    
+    for col_idx, header in enumerate(log_headers, start=1):
+        future_log.cell(row=1, column=col_idx, value=header)
+    
+    # Add processing summary
+    timestamp = datetime.now().isoformat()
+    future_log.cell(row=2, column=1, value=timestamp)
+    future_log.cell(row=2, column=2, value="XAV to FUTURE")
+    future_log.cell(row=2, column=3, value=len(processed_data))
+    future_log.cell(row=2, column=4, value=len(unmapped_accounts))
+    future_log.cell(row=2, column=5, value=len(unique_ccs))
+    future_log.cell(row=2, column=6, value=len(future_months))
+    future_log.cell(row=2, column=7, value="Success")
+    
+    update_status(f"Updated {future_log_name} with processing summary")
+    
+    # STEP 7: Handle unmapped accounts (create processlogFuture if needed)
+    if unmapped_accounts:
+        update_status("Creating processlogFuture for unmapped accounts...")
+        
+        # Create processlogFuture sheet
+        process_log_name = "processlogFuture"
+        log_headers = ["Timestamp", "Account", "Period", "CC", "Amount", "Error"]
+        
+        if process_log_name in workbook.sheetnames:
+            # Remove existing sheet
+            del workbook[process_log_name]
+        
+        # Create new sheet after FutureLog
+        logs_index = workbook.sheetnames.index(future_log_name)
+        processlogFuture = workbook.create_sheet(process_log_name, logs_index + 1)
+        
+        # Add headers
+        for col_idx, header in enumerate(log_headers, start=1):
+            processlogFuture.cell(row=1, column=col_idx, value=header)
+        
+        # Add unmapped accounts
+        for row_idx, item in enumerate(unmapped_accounts, start=2):
+            timestamp = datetime.now().isoformat()
+            processlogFuture.cell(row=row_idx, column=1, value=timestamp)
+            processlogFuture.cell(row=row_idx, column=2, value=item['account'])
+            processlogFuture.cell(row=row_idx, column=3, value=item['period'])
+            processlogFuture.cell(row=row_idx, column=4, value=item['cc'])
+            processlogFuture.cell(row=row_idx, column=5, value=item['amount'])
+            processlogFuture.cell(row=row_idx, column=6, value="Account mapping not found")
+        
+        update_status(f"Created {process_log_name} with {len(unmapped_accounts)} unmapped accounts")
+    
+    # STEP 8: Update the FUTURE sheet
+    update_status("Updating FUTURE sheet...")
+    
+    # Clear the existing sheet
+    for row in future_sheet.iter_rows():
+        for cell in row:
+            cell.value = None
+    
+    # Add the new data
+    for row_idx, row_data in enumerate(future_rows, start=1):
+        for col_idx, value in enumerate(row_data, start=1):
+            future_sheet.cell(row=row_idx, column=col_idx, value=value)
+    
+    # STEP 9: Save the workbook
+    update_status(f"Saving updated workbook to {output_file}...")
+    workbook.save(output_file)
+    
+    update_status("Processing completed successfully!")
+    return output_file
+
+
+class XAVProcessorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("XAV to FUTURE Processor")
+        self.root.geometry("600x500")
+        self.root.resizable(True, True)
+        
+        # Create a frame for the file selection
+        file_frame = ttk.Frame(root, padding="10")
+        file_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # File selection
+        ttk.Label(file_frame, text="Select XAV Excel File:").grid(column=0, row=0, sticky=tk.W, pady=5)
+        
+        self.file_path = tk.StringVar()
+        ttk.Entry(file_frame, textvariable=self.file_path, width=50).grid(column=0, row=1, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Button(file_frame, text="Browse...", command=self.browse_file).grid(column=1, row=1, padx=5, pady=5)
+        
+        # Output file options
+        output_frame = ttk.Frame(root, padding="10")
+        output_frame.pack(fill=tk.X, padx=10, pady=0)
+        
+        ttk.Label(output_frame, text="Output Options:").grid(column=0, row=0, sticky=tk.W, pady=5)
+        
+        self.output_same = tk.BooleanVar(value=True)
+        ttk.Radiobutton(output_frame, text="Create new file (original filename + ' - Processed')", 
+                        variable=self.output_same, value=True).grid(column=0, row=1, sticky=tk.W, pady=2)
+        
+        ttk.Radiobutton(output_frame, text="Specify output file", 
+                        variable=self.output_same, value=False).grid(column=0, row=2, sticky=tk.W, pady=2)
+        
+        self.output_path = tk.StringVar()
+        self.output_entry = ttk.Entry(output_frame, textvariable=self.output_path, width=50, state='disabled')
+        self.output_entry.grid(column=0, row=3, sticky=(tk.W, tk.E), pady=5)
+        
+        self.browse_output_btn = ttk.Button(output_frame, text="Browse...", command=self.browse_output_file, state='disabled')
+        self.browse_output_btn.grid(column=1, row=3, padx=5, pady=5)
+        
+        # Bind change in radio buttons
+        self.output_same.trace_add("write", self.toggle_output_entry)
+        
+        # Create a frame for the process button
+        button_frame = ttk.Frame(root, padding="10")
+        button_frame.pack(fill=tk.X, padx=10, pady=0)
+        
+        self.process_btn = ttk.Button(button_frame, text="Process XAV Data", command=self.process_file)
+        self.process_btn.pack(pady=10)
+        
+        # Status frame
+        status_frame = ttk.LabelFrame(root, text="Processing Status", padding="10")
+        status_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Status text widget
+        self.status_text = tk.Text(status_frame, wrap=tk.WORD, width=70, height=15)
+        self.status_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(status_frame, orient=tk.VERTICAL, command=self.status_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.status_text.configure(yscrollcommand=scrollbar.set)
+        
+        # Initial status
+        self.update_status("Ready to process XAV data. Please select an Excel file.")
+    
+    def browse_file(self):
+        """Open file dialog to select input file"""
+        filetypes = [("Excel files", "*.xlsx"), ("All files", "*.*")]
+        filename = filedialog.askopenfilename(title="Select XAV Excel File", filetypes=filetypes)
+        if filename:
+            self.file_path.set(filename)
+            self.update_status(f"Selected file: {filename}")
+    
+    def browse_output_file(self):
+        """Open file dialog to select output file"""
+        filetypes = [("Excel files", "*.xlsx"), ("All files", "*.*")]
+        filename = filedialog.asksaveasfilename(title="Save Processed File As", 
+                                              filetypes=filetypes, 
+                                              defaultextension=".xlsx")
+        if filename:
+            self.output_path.set(filename)
+    
+    def toggle_output_entry(self, *args):
+        """Enable/disable output file entry based on radio button selection"""
+        if not self.output_same.get():
+            self.output_entry.config(state='normal')
+            self.browse_output_btn.config(state='normal')
+        else:
+            self.output_entry.config(state='disabled')
+            self.browse_output_btn.config(state='disabled')
+    
+    def update_status(self, message):
+        """Update status text widget"""
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.insert(tk.END, f"{message}\n")
+        self.status_text.see(tk.END)
+        self.status_text.config(state=tk.DISABLED)
+        self.root.update_idletasks()
+    
+    def process_file(self):
+        """Process the selected file"""
+        input_file = self.file_path.get()
+        
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror("Error", "Please select a valid input file.")
+            return
+        
+        # Determine output file
+        if self.output_same.get():
+            output_file = None  # Use default naming
+        else:
+            output_file = self.output_path.get()
+            if not output_file:
+                messagebox.showerror("Error", "Please specify an output file path.")
+                return
+        
+        # Clear status
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.delete(1.0, tk.END)
+        self.status_text.config(state=tk.DISABLED)
+        
+        # Disable process button during processing
+        self.process_btn.config(state='disabled')
+        
+        try:
+            output_path = process_xav_data(input_file, output_file, self.update_status)
+            messagebox.showinfo("Success", f"Processing completed successfully!\nOutput saved to: {output_path}")
+        except Exception as e:
+            self.update_status(f"ERROR: {str(e)}")
+            self.update_status(traceback.format_exc())
+            messagebox.showerror("Error", f"An error occurred: {str(e)}")
+        finally:
+            # Re-enable process button
+            self.process_btn.config(state='normal')
+
+
+def main():
+    """
+    Launch the GUI or run command line processing based on arguments
+    """
+    if len(sys.argv) > 1:
+        # Command line mode
+        input_file = sys.argv[1]
+        output_file = sys.argv[2] if len(sys.argv) > 2 else None
+        
+        try:
+            output_path = process_xav_data(input_file, output_file)
+            print(f"Output saved to: {output_path}")
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+    else:
+        # GUI mode
+        root = tk.Tk()
+        app = XAVProcessorApp(root)
+        root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
