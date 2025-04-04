@@ -1,0 +1,523 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk, simpledialog
+from tkinter import Listbox, MULTIPLE
+import pandas as pd
+import openpyxl
+from openpyxl.utils.exceptions import InvalidFileException
+from zipfile import BadZipFile
+from datetime import datetime
+import os
+import logging
+import sys
+from difflib import SequenceMatcher
+import itertools
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('arnold_processor_detailed.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def fuzzy_match(str1, str2, threshold=0.8):
+    if not str1 or not str2:
+        return False
+    s1 = str(str1).lower().strip()
+    s2 = str(str2).lower().strip()
+    if s1 == s2 or s1 in s2 or s2 in s1:
+        return True
+    ratio = SequenceMatcher(None, s1, s2).ratio()
+    return (ratio >= threshold)
+
+def is_date_in_range(date_str, start_str, end_str):
+    try:
+        dt = pd.to_datetime(date_str, errors='coerce')
+        if not dt or pd.isnull(dt):
+            return False
+        st = pd.to_datetime(start_str, errors='coerce')
+        en = pd.to_datetime(end_str, errors='coerce')
+        if not st or not en:
+            return False
+        return (st <= dt <= en)
+    except:
+        return False
+
+class VoiceMonthSelector(simpledialog.Dialog):
+    def __init__(self, parent, title, voice_months):
+        self.voice_months = voice_months
+        self.selected_months = []
+        super().__init__(parent, title)
+    
+    def body(self, frame):
+        ttk.Label(frame, text="Select voice months to process:").grid(row=0, column=0, sticky=tk.W, pady=(0,5))
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL)
+        self.listbox = Listbox(frame, selectmode=MULTIPLE, height=10, width=40, yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.listbox.yview)
+        self.listbox.grid(row=1, column=0, sticky=tk.NSEW)
+        scrollbar.grid(row=1, column=1, sticky=tk.NS)
+        sorted_months = sorted(self.voice_months)
+        for m in sorted_months:
+            self.listbox.insert(tk.END, m)
+        for i in range(len(self.voice_months)):
+            self.listbox.selection_set(i)
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=5)
+        ttk.Button(btn_frame, text="Select All", command=self.select_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Deselect All", command=self.deselect_all).pack(side=tk.LEFT)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        return self.listbox
+    
+    def select_all(self):
+        self.listbox.selection_set(0, tk.END)
+    
+    def deselect_all(self):
+        self.listbox.selection_clear(0, tk.END)
+    
+    def apply(self):
+        selection = self.listbox.curselection()
+        sorted_months = sorted(self.voice_months)
+        self.selected_months = [sorted_months[int(i)] for i in selection]
+
+def process_arnold_data(input_file, output_file=None, status_callback=None, selected_months=None):
+    def log_message(msg, level='INFO'):
+        if status_callback:
+            status_callback(msg)
+        if level=='DEBUG':
+            logger.debug(msg)
+        elif level=='WARNING':
+            logger.warning(msg)
+        elif level=='ERROR':
+            logger.error(msg)
+        else:
+            logger.info(msg)
+        print(msg)
+    
+    try:
+        if output_file is None:
+            base, ext = os.path.splitext(input_file)
+            output_file = f"{base} - Processed Arnold{ext}"
+        log_message(f"Processing ARNOLD from => {input_file}")
+        log_message(f"Output => {output_file}")
+        is_macro = input_file.lower().endswith('.xlsm')
+        try:
+            if is_macro:
+                wb = openpyxl.load_workbook(input_file, keep_vba=True)
+                log_message("Detected .xlsm => keep_vba=True", 'DEBUG')
+            else:
+                wb = openpyxl.load_workbook(input_file)
+        except (BadZipFile, InvalidFileException) as e:
+            raise ValueError(f"Corrupt or invalid file => {e}")
+        if is_macro and not output_file.lower().endswith('.xlsm'):
+            base, _ = os.path.splitext(output_file)
+            output_file = f"{base}.xlsm"
+            log_message(f"Changed output to .xlsm => {output_file}", 'DEBUG')
+        if selected_months:
+            log_message(f"Selected voice months => {selected_months}")
+        else:
+            log_message("No month filter => all months used.")
+        if "Reference Mapping" not in wb.sheetnames:
+            raise ValueError("Missing 'Reference Mapping' sheet.")
+        ref_sheet = wb["Reference Mapping"]
+        timeframe_map = {}
+        for row_idx in range(3, ref_sheet.max_row+1):
+            mval = ref_sheet.cell(row=row_idx, column=13).value
+            tfval = ref_sheet.cell(row=row_idx, column=14).value
+            if mval and tfval and 'to' in str(tfval).lower():
+                parts = str(tfval).split('to')
+                start_s = parts[0].strip()
+                end_s = parts[1].strip()
+                timeframe_map[str(mval).strip()] = (start_s, end_s)
+        if "Arnold Mapping" not in wb.sheetnames:
+            raise ValueError("Missing 'Arnold Mapping' sheet.")
+        am_sheet = wb["Arnold Mapping"]
+        am_col = {}
+        for c in range(1, am_sheet.max_column+1):
+            hv = am_sheet.cell(row=1, column=c).value
+            if hv:
+                am_col[str(hv).strip()] = c
+        xo_to_name = {}
+        for row_idx in range(2, am_sheet.max_row+1):
+            xo_val = ""
+            nm_val = ""
+            if "XO" in am_col:
+                x = am_sheet.cell(row=row_idx, column=am_col["XO"]).value
+                if x:
+                    xo_val = str(x).strip()
+            if "Name" in am_col:
+                n = am_sheet.cell(row=row_idx, column=am_col["Name"]).value
+                if n:
+                    nm_val = str(n).strip()
+            if xo_val and nm_val:
+                for xpart in xo_val.split(','):
+                    x_str = xpart.strip()
+                    xo_to_name[x_str] = nm_val
+        if "XAV Extract" not in wb.sheetnames:
+            raise ValueError("Missing 'XAV Extract' sheet.")
+        xav_sheet = wb["XAV Extract"]
+        xav_col = {}
+        for c in range(1, xav_sheet.max_column+1):
+            hv = xav_sheet.cell(row=1, column=c).value
+            if hv:
+                xav_col[str(hv).strip()] = c
+        needed_cols = ["CC", "XO", "Voice Date", "Voice Num", "Amount"]
+        for nc in needed_cols:
+            if nc not in xav_col:
+                log_message(f"Missing '{nc}' in XAV Extract => partial data read", 'WARNING')
+        def val_for(row_i, col_name):
+            if col_name not in xav_col:
+                return ""
+            cid = xav_col[col_name]
+            return xav_sheet.cell(row=row_i, column=cid).value
+        data_rows = []
+        for row_idx in range(2, xav_sheet.max_row+1):
+            cc_val = val_for(row_idx, "CC")
+            xo_val = val_for(row_idx, "XO")
+            dt_val = val_for(row_idx, "Voice Date")
+            vn_val = val_for(row_idx, "Voice Num")
+            amt_val = val_for(row_idx, "Amount")
+            if not any([cc_val, xo_val, dt_val, vn_val, amt_val]):
+                continue
+            cc_str = str(cc_val).strip() if cc_val else ""
+            raw_xo = str(xo_val).strip() if xo_val else ""
+            if raw_xo.lower() == "none":
+                raw_xo = ""
+            dt_str = str(dt_val).strip() if dt_val else ""
+            vn_str = str(vn_val).strip() if vn_val else ""
+            amt_f = float(amt_val) if amt_val else 0.0
+            assigned_month = None
+            for m, (start_s, end_s) in timeframe_map.items():
+                if is_date_in_range(dt_str, start_s, end_s):
+                    assigned_month = m
+                    break
+            if not assigned_month:
+                continue
+            data_rows.append({
+                "CC": cc_str,
+                "XO": raw_xo,
+                "Date": dt_str,
+                "VoiceNum": vn_str,
+                "Month": assigned_month,
+                "Amount": amt_f
+            })
+        aggregator_list = []
+        bonus_log = []
+        data_sorted = sorted(data_rows, key=lambda x: (x["Month"], x["VoiceNum"]))
+        for (mon, vnum), group_iter in itertools.groupby(data_sorted, key=lambda r: (r["Month"], r["VoiceNum"])):
+            group_list = list(group_iter)
+            no_xo_sum = sum(r["Amount"] for r in group_list if not r["XO"])
+            for row_item in group_list:
+                cc = row_item["CC"]
+                xo = row_item["XO"]
+                amt = row_item["Amount"]
+                wb_amt = amt
+                wb2_amt = 0.0
+                if xo:
+                    if no_xo_sum > 0:
+                        wb2_amt = amt + no_xo_sum
+                bonus_log.append({
+                    "Month": mon,
+                    "VoiceNum": vnum,
+                    "CC": cc,
+                    "XO": xo,
+                    "OriginalAmt": amt,
+                    "NoXOSum": no_xo_sum,
+                    "WithoutBonus": wb_amt,
+                    "WithBonus": wb2_amt
+                })
+                aggregator_list.append({
+                    "CC": cc,
+                    "XO": xo,
+                    "Month": mon,
+                    "BonusType": "Without Bonus",
+                    "Amount": wb_amt
+                })
+                aggregator_list.append({
+                    "CC": cc,
+                    "XO": xo,
+                    "Month": mon,
+                    "BonusType": "With Bonus",
+                    "Amount": wb2_amt
+                })
+        unmapped_xo = []
+        aggregator_final = {}
+        for row_item in aggregator_list:
+            cc = row_item["CC"]
+            xo = row_item["XO"]
+            mon = row_item["Month"]
+            btype = row_item["BonusType"]
+            amt_val = row_item["Amount"]
+            if xo:
+                if xo not in xo_to_name:
+                    unmapped_xo.append(xo)
+                    continue
+                name_str = xo_to_name[xo]
+            else:
+                continue
+            key = (cc, name_str, mon, btype)
+            aggregator_final[key] = aggregator_final.get(key, 0) + amt_val
+        arnold_sheet = wb["ARNOLD"]
+        month_header_row = 56
+        month_headers = {}
+        for c in range(1, arnold_sheet.max_column+1):
+            val = arnold_sheet.cell(row=month_header_row, column=c).value
+            if val:
+                month_headers[str(val).strip()] = c
+        cc_name_rows = {}
+        for r in range(57, arnold_sheet.max_row+1):
+            cc_val = arnold_sheet.cell(row=r, column=1).value
+            nm_val = arnold_sheet.cell(row=r, column=2).value
+            if cc_val and nm_val:
+                cc_str = str(cc_val).strip()
+                nm_str = str(nm_val).strip()
+                cc_name_rows[(cc_str, nm_str)] = r
+        updates_made = 0
+        updates_failed = 0
+        unmapped_cc_name = []
+        def update_arnold_cell(cc, name, month, btype, amt):
+            nonlocal updates_made, updates_failed
+            col_label = f"{month} {btype}"
+            alt_label = f"{month}{btype}"
+            if col_label in month_headers:
+                col_idx = month_headers[col_label]
+            elif alt_label in month_headers:
+                col_idx = month_headers[alt_label]
+            else:
+                log_message(f"No column for '{col_label}' or '{alt_label}'", 'WARNING')
+                updates_failed += 1
+                return
+            if (cc, name) not in cc_name_rows:
+                log_message(f"(CC={cc},Name={name}) not found in ARNOLD row≥57 => colA=CC colB=Name", 'WARNING')
+                unmapped_cc_name.append((cc, name))
+                updates_failed += 1
+                return
+            row_idx = cc_name_rows[(cc, name)]
+            arnold_sheet.cell(row=row_idx, column=col_idx).value = amt
+            updates_made += 1
+        for (cc, nm, m, btype), sum_val in aggregator_final.items():
+            update_arnold_cell(cc, nm, m, btype, sum_val)
+        log_message(f"Populated ARNOLD => {updates_made} updates, {updates_failed} fails", 'INFO')
+        logs_sheet_name = "LOGS >>"
+        if logs_sheet_name not in wb.sheetnames:
+            wb.create_sheet(logs_sheet_name)
+        logs_idx = wb.sheetnames.index(logs_sheet_name)
+        bonus_log_name = "ArnoldBonusLog"
+        if bonus_log_name in wb.sheetnames:
+            del wb[bonus_log_name]
+        bsheet = wb.create_sheet(bonus_log_name, logs_idx+1)
+        bheaders = ["Timestamp", "Month", "VoiceNum", "CC", "XO", "OriginalAmt", "NoXOSum", "WithoutBonus", "WithBonus"]
+        for i, h in enumerate(bheaders, start=1):
+            bsheet.cell(row=1, column=i, value=h)
+        time_now = datetime.now().isoformat()
+        row_ptr = 2
+        for row_item in bonus_log:
+            bsheet.cell(row=row_ptr, column=1, value=time_now)
+            bsheet.cell(row=row_ptr, column=2, value=row_item["Month"])
+            bsheet.cell(row=row_ptr, column=3, value=row_item["VoiceNum"])
+            bsheet.cell(row=row_ptr, column=4, value=row_item["CC"])
+            bsheet.cell(row=row_ptr, column=5, value=row_item["XO"])
+            bsheet.cell(row=row_ptr, column=6, value=row_item["OriginalAmt"])
+            bsheet.cell(row=row_ptr, column=7, value=row_item["NoXOSum"])
+            bsheet.cell(row=row_ptr, column=8, value=row_item["WithoutBonus"])
+            bsheet.cell(row=row_ptr, column=9, value=row_item["WithBonus"])
+            row_ptr += 1
+        if unmapped_xo:
+            xolog_name = "UnmappedXOLog"
+            if xolog_name in wb.sheetnames:
+                del wb[xolog_name]
+            xolog = wb.create_sheet(xolog_name, logs_idx+2)
+            xheads = ["Timestamp", "XO", "Reason"]
+            for i, h in enumerate(xheads, start=1):
+                xolog.cell(row=1, column=i, value=h)
+            row_ptr = 2
+            for xval in sorted(set(unmapped_xo)):
+                xolog.cell(row=row_ptr, column=1, value=time_now)
+                xolog.cell(row=row_ptr, column=2, value=xval)
+                xolog.cell(row=row_ptr, column=3, value="XO not found in Arnold Mapping => no Name")
+                row_ptr += 1
+        if unmapped_cc_name:
+            mismatch_log = "CCNameMismatchLog"
+            if mismatch_log in wb.sheetnames:
+                del wb[mismatch_log]
+            mismatch_sheet = wb.create_sheet(mismatch_log, logs_idx+3)
+            mheads = ["Timestamp", "CC", "Name", "Reason"]
+            for i, h in enumerate(mheads, start=1):
+                mismatch_sheet.cell(row=1, column=i, value=h)
+            row_ptr = 2
+            for (cc_val, nm_val) in set(unmapped_cc_name):
+                mismatch_sheet.cell(row=row_ptr, column=1, value=time_now)
+                mismatch_sheet.cell(row=row_ptr, column=2, value=cc_val)
+                mismatch_sheet.cell(row=row_ptr, column=3, value=nm_val)
+                mismatch_sheet.cell(row=row_ptr, column=4, value="(CC,Name) not found in ARNOLD row≥57 => colA=CC colB=Name")
+                row_ptr += 1
+        wb.save(output_file)
+        log_message(f"Saved final => {output_file}", 'INFO')
+        return output_file
+    except Exception as e:
+        logger.exception("process_arnold_data error:")
+        raise
+
+class ArnoldProcessorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ARNOLD XAV Processor - Show Both Without/With Bonus")
+        self.root.geometry("900x600")
+        self.file_path = tk.StringVar()
+        self.selected_months = None
+        main_frame = ttk.Frame(root, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        title_label = ttk.Label(main_frame, text="ARNOLD XAV Processor", font=("Arial", 16, "bold"))
+        title_label.pack(pady=(0,20))
+        instructions = (
+            "Logic:\n"
+            "- If row has XO => 'With Bonus' = original + sum(no-XO) if >0 else 0,\n"
+            "  'Without Bonus' = original.\n"
+            "- If no XO => 'Without Bonus' = original, 'With Bonus' = 0.\n"
+            "- Summed aggregator => place in ARNOLD row≥57 => col1=CC, col2=Name.\n"
+            "- We produce multiple logs for unmapped XO or mismatch.\n"
+            "- Preserves .xlsm macros.\n"
+            "- You can optionally select which months to update from 'Reference Mapping'.\n"
+        )
+        ttk.Label(main_frame, text=instructions, justify=tk.LEFT).pack(anchor=tk.W, pady=(0,15))
+        file_frame = ttk.LabelFrame(main_frame, text="File Selection", padding=10)
+        file_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(file_frame, text="Select Excel File:").grid(row=0, column=0, sticky=tk.W)
+        self.file_entry = ttk.Entry(file_frame, textvariable=self.file_path, width=60)
+        self.file_entry.grid(row=0, column=1, sticky=tk.EW, padx=5)
+        ttk.Button(file_frame, text="Browse...", command=self.browse_file).grid(row=0, column=2, padx=5)
+        file_frame.columnconfigure(1, weight=1)
+        month_frame = ttk.LabelFrame(main_frame, text="Voice Months (Optional)", padding=10)
+        month_frame.pack(fill=tk.X, pady=5)
+        self.month_label = ttk.Label(month_frame, text="All voice months will be processed by default")
+        self.month_label.pack(side=tk.LEFT, padx=5)
+        ttk.Button(month_frame, text="Scan/Select Voice Months", command=self.scan_and_select_months).pack(side=tk.RIGHT, padx=5)
+        self.process_btn = ttk.Button(main_frame, text="Process File", command=self.process_file, state=tk.DISABLED)
+        self.process_btn.pack(pady=10)
+        self.progress = ttk.Progressbar(main_frame, orient=tk.HORIZONTAL, length=100, mode='indeterminate')
+        status_frame = ttk.LabelFrame(main_frame, text="Processing Status", padding=10)
+        status_frame.pack(fill=tk.BOTH, expand=True)
+        self.status_text = tk.Text(status_frame, wrap=tk.WORD, height=12)
+        self.status_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollb = ttk.Scrollbar(status_frame, orient=tk.VERTICAL, command=self.status_text.yview)
+        scrollb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.status_text.configure(yscrollcommand=scrollb.set)
+        self.log_message("Ready. Please select a file.", "INFO")
+    
+    def log_message(self, msg, level="INFO"):
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.insert(tk.END, f"{msg}\n")
+        self.status_text.see(tk.END)
+        self.status_text.config(state=tk.DISABLED)
+        self.root.update_idletasks()
+    
+    def browse_file(self):
+        filepath = filedialog.askopenfilename(
+            title="Select Excel File",
+            filetypes=[("Excel Files", "*.xlsx *.xlsm *.xlsb *.xls")]
+        )
+        if filepath:
+            self.file_path.set(filepath)
+            self.log_message(f"Selected file: {filepath}")
+            self.process_btn.configure(state=tk.NORMAL)
+            self.selected_months = None
+            self.month_label.config(text="All voice months will be processed by default")
+    
+    def scan_and_select_months(self):
+        if not self.file_path.get():
+            messagebox.showerror("Error", "Please select a file first.")
+            return
+        fpath = self.file_path.get()
+        try:
+            is_macro_file = fpath.lower().endswith('.xlsm')
+            if is_macro_file:
+                wb = openpyxl.load_workbook(fpath, keep_vba=True)
+            else:
+                wb = openpyxl.load_workbook(fpath, read_only=True)
+            if "Reference Mapping" not in wb.sheetnames:
+                messagebox.showwarning("No 'Reference Mapping'", "Cannot find 'Reference Mapping' sheet.")
+                return
+            ref_sheet = wb["Reference Mapping"]
+            discovered = []
+            for row_idx in range(3, ref_sheet.max_row+1):
+                m_val = ref_sheet.cell(row=row_idx, column=13).value
+                if m_val:
+                    discovered.append(str(m_val).strip())
+            discovered = sorted(set(discovered))
+            if not discovered:
+                messagebox.showinfo("No Voice Months", "No voice months found in 'Reference Mapping'.")
+                return
+            dlg = VoiceMonthSelector(self.root, "Select Voice Months", discovered)
+            if dlg.selected_months:
+                self.selected_months = dlg.selected_months
+                if len(self.selected_months) < len(discovered):
+                    self.month_label.config(text=f"Selected months: {', '.join(self.selected_months)}")
+                    self.log_message(f"User selected {len(self.selected_months)} => {self.selected_months}")
+                else:
+                    self.month_label.config(text="All discovered months selected")
+                    self.log_message("All discovered months selected.")
+            else:
+                self.selected_months = None
+                self.month_label.config(text="No months selected => ALL")
+                self.log_message("No months selected => ALL")
+        except Exception as e:
+            self.log_message(f"Error scanning months => {e}", 'ERROR')
+            messagebox.showerror("Error scanning months", str(e))
+    
+    def process_file(self):
+        if not self.file_path.get():
+            messagebox.showerror("Error", "Please select a file first.")
+            return
+        in_file = self.file_path.get()
+        base, ext = os.path.splitext(in_file)
+        out_file = f"{base} - Processed Arnold{ext}"
+        if os.path.exists(out_file):
+            ans = messagebox.askyesno("File Exists", f"{out_file} already exists. Overwrite?")
+            if not ans:
+                self.log_message("User cancelled => process aborted.")
+                return
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.delete(1.0, tk.END)
+        self.status_text.config(state=tk.DISABLED)
+        self.process_btn.configure(state=tk.DISABLED)
+        self.progress.pack(fill=tk.X, pady=5)
+        self.progress.start()
+        self.log_message(f"Processing file => {in_file}")
+        self.log_message(f"Output => {out_file}")
+        self.root.after(100, self.run_processing, in_file, out_file)
+    
+    def run_processing(self, in_file, out_file):
+        try:
+            result_file = process_arnold_data(
+                input_file=in_file,
+                output_file=out_file,
+                status_callback=self.log_message,
+                selected_months=self.selected_months
+            )
+            self.log_message("Processing completed successfully!")
+            self.log_message(f"Output => {result_file}")
+            open_now = messagebox.askyesno("Complete", f"Open now?\n\n{result_file}")
+            if open_now:
+                import platform, subprocess
+                system = platform.system()
+                if system == "Windows":
+                    os.startfile(result_file)
+                elif system == "Darwin":
+                    subprocess.call(["open", result_file])
+                else:
+                    subprocess.call(["xdg-open", result_file])
+        except Exception as e:
+            self.log_message(f"Error => {e}", 'ERROR')
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.progress.stop()
+            self.progress.pack_forget()
+            self.process_btn.configure(state=tk.NORMAL)
+
+if __name__ == "__main__":
+    from tkinter import ttk
+    root = tk.Tk()
+    app = ArnoldProcessorApp(root)
+    root.mainloop()
