@@ -1,518 +1,961 @@
-import pandas as pd
-import numpy as np
-import openpyxl
-from openpyxl.utils.dataframe import dataframe_to_rows
-from datetime import datetime
-import os
-import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-import traceback
+import pandas as pd
+import openpyxl
+from datetime import datetime
+import os
+import logging
+import sys
+from tkinter import simpledialog, Listbox, MULTIPLE
 
-def process_xav_data(input_file, output_file=None, status_callback=None, selected_periods=None):
-    """
-    Process XAV Excel file and update the FUTURE sheet.
-    
-    Args:
-        input_file (str): Path to the input Excel file
-        output_file (str, optional): Path to save the output Excel file. 
-                                    If None, will modify the input file name.
-        status_callback (function, optional): Callback function to update status
-        selected_periods (list, optional): List of periods to process. If None, process all.
-    
-    Returns:
-        str: Path to the output file
-    """
-    def update_status(message):
-        if status_callback:
-            status_callback(message)
-        else:
-            print(message)
-    
-    if output_file is None:
-        file_name, file_ext = os.path.splitext(input_file)
-        output_file = f"{file_name} - Processed{file_ext}"
-    
-    update_status(f"Processing {input_file}...")
-    
-    # Load the Excel workbook
-    workbook = openpyxl.load_workbook(input_file)
-    
-    # Check for required sheets
-    required_sheets = ["XAV Extract", "Account Mapping", "Reference Mapping", "FUTURE"]
-    missing_sheets = [sheet for sheet in required_sheets if sheet not in workbook.sheetnames]
-    
-    if missing_sheets:
-        raise ValueError(f"Missing required sheets: {', '.join(missing_sheets)}")
-    
-    # STEP 1: Extract data from the required sheets
-    update_status("Extracting data from required sheets...")
-    
-    # Get XAV Extract data
-    xav_sheet = workbook["XAV Extract"]
-    
-    # Find headers in XAV Extract
-    period_col = None
-    account_col = None
-    cc_col = None
-    amount_col = None
-    
-    # Scan the first row to find column headers
-    for cell in xav_sheet[1]:
-        if cell.value == "Period":
-            period_col = cell.column_letter
-        elif cell.value == "Nat Account":
-            account_col = cell.column_letter
-        elif cell.value == "CC":
-            cc_col = cell.column_letter
-        elif cell.value == "Amount":
-            amount_col = cell.column_letter
-    
-    if not all([period_col, account_col, cc_col, amount_col]):
-        raise ValueError("Could not find all required columns in XAV Extract sheet")
-    
-    update_status(f"Found XAV Extract columns: Period={period_col}, Nat Account={account_col}, CC={cc_col}, Amount={amount_col}")
-    
-    # Read XAV data
-    xav_data = []
-    row_num = 2  # Start from row 2 (after header)
-    while True:
-        period = xav_sheet[f"{period_col}{row_num}"].value
-        account = xav_sheet[f"{account_col}{row_num}"].value
-        cc = xav_sheet[f"{cc_col}{row_num}"].value
-        amount = xav_sheet[f"{amount_col}{row_num}"].value
-        
-        # Stop when we hit a blank row
-        if period is None and account is None and cc is None and amount is None:
-            break
-        
-        if period and account and cc and amount:
-            xav_data.append({
-                "Period": period,
-                "Nat Account": str(account),
-                "CC": str(cc),
-                "Amount": float(amount)
-            })
-        
-        row_num += 1
-    
-    update_status(f"Read {len(xav_data)} rows from XAV Extract")
-    
-    # Get Account Mapping data
-    account_sheet = workbook["Account Mapping"]
-    
-    # Find headers in Account Mapping
-    account_col = None
-    report_col = None
-    
-    for cell in account_sheet[1]:
-        if cell.value == "Account":
-            account_col = cell.column_letter
-        elif cell.value == "REPORT 2":
-            report_col = cell.column_letter
-    
-    if not all([account_col, report_col]):
-        raise ValueError("Could not find all required columns in Account Mapping sheet")
-    
-    update_status(f"Found Account Mapping columns: Account={account_col}, REPORT 2={report_col}")
-    
-    # Read Account Mapping
-    account_to_tag = {}
-    row_num = 2  # Start from row 2 (after header)
-    while True:
-        account = account_sheet[f"{account_col}{row_num}"].value
-        tag = account_sheet[f"{report_col}{row_num}"].value
-        
-        # Stop when we hit a blank row
-        if account is None:
-            break
-        
-        if account and tag:
-            account_to_tag[str(account)] = tag
-        
-        row_num += 1
-    
-    update_status(f"Found {len(account_to_tag)} account to tag mappings")
-    
-    # Get Reference Mapping data for period to month
-    ref_sheet = workbook["Reference Mapping"]
-    
-    # Find headers in Reference Mapping - note: the sheet structure is offset, starting at row 2
-    actual_month_col = None
-    xav_month_col = None
-    
-    # Check row 2 for headers
-    for cell in ref_sheet[2]:
-        if cell.value == "Actual Month":
-            actual_month_col = cell.column_letter
-        elif cell.value == "Current XAV Month":
-            xav_month_col = cell.column_letter
-    
-    if not all([actual_month_col, xav_month_col]):
-        raise ValueError("Could not find all required columns in Reference Mapping sheet")
-    
-    update_status(f"Found Reference Mapping columns: Actual Month={actual_month_col}, Current XAV Month={xav_month_col}")
-    
-    # Read period to month mapping
-    period_to_month = {}
-    row_num = 3  # Start from row 3 (after header)
-    while True:
-        actual_month = ref_sheet[f"{actual_month_col}{row_num}"].value
-        xav_month = ref_sheet[f"{xav_month_col}{row_num}"].value
-        
-        # Stop when we hit a blank row
-        if actual_month is None and xav_month is None:
-            break
-        
-        if actual_month and xav_month:
-            period_to_month[xav_month] = actual_month
-        
-        row_num += 1
-    
-    update_status(f"Found {len(period_to_month)} period to month mappings")
-    
-    # Find Report to Future Tag mapping
-    # The structure shows this is in Reference Mapping around row 16
-    mapping_found = False
-    tag_to_future_tag = {}
-    
-    # Scan the entire Reference Mapping sheet for the section
-    for row_num in range(1, ref_sheet.max_row + 1):
-        # Look for the "Account Mapping" and "FUTURE" headers
-        cell_account = ref_sheet.cell(row=row_num, column=3).value
-        cell_future = ref_sheet.cell(row=row_num, column=4).value
-        
-        if cell_account == "Account Mapping" and cell_future == "FUTURE":
-            mapping_found = True
-            # Start reading from the next row
-            row_num += 1
-            
-            # Read mappings until blank row
-            while row_num <= ref_sheet.max_row:
-                tag = ref_sheet.cell(row=row_num, column=3).value
-                future_tag = ref_sheet.cell(row=row_num, column=4).value
-                
-                if tag is None or future_tag is None:
-                    break
-                
-                tag_to_future_tag[tag] = future_tag
-                row_num += 1
-            
-            break
-    
-    if not mapping_found:
-        update_status("WARNING: Could not find 'Account Mapping' to 'FUTURE' mapping section")
-    
-    update_status(f"Found {len(tag_to_future_tag)} tag to future tag mappings")
-    
-    # STEP 3: Process the XAV data
-    update_status("Processing XAV data...")
-    
-    processed_data = []
-    unmapped_accounts = []
-    
-    # Filter by selected periods if specified
-    for row in xav_data:
-        account = row["Nat Account"]
-        cc = row["CC"]
-        period = row["Period"]
-        amount = row["Amount"]
-        
-        # Skip if this period is not selected (if selection is provided)
-        if selected_periods is not None and period not in selected_periods:
-            continue
-        
-        # Check if account mapping exists
-        if account not in account_to_tag:
-            unmapped_accounts.append({
-                'account': account,
-                'period': period,
-                'cc': cc,
-                'amount': amount
-            })
-            continue  # Skip this row
-        
-        tag = account_to_tag[account]
-        future_tag = tag_to_future_tag.get(tag, tag)  # Use mapped tag or original if not mapped
-        month = period_to_month.get(period, period)  # Use mapped month or original if not mapped
-        
-        processed_data.append({
-            'cc': cc,
-            'tag': future_tag,
-            'period': period,
-            'month': month,
-            'amount': amount
-        })
-    
-    update_status(f"Processed {len(processed_data)} rows of data")
-    
-    if unmapped_accounts:
-        update_status(f"WARNING: Found {len(unmapped_accounts)} unmapped accounts")
-    
-    # STEP 4: Aggregate data by CC, tag, and month
-    update_status("Aggregating data...")
-    
-    # Group by CC, tag, and month and sum the amounts
-    aggregated_data = {}
-    
-    for row in processed_data:
-        key = (row['cc'], row['tag'], row['month'])
-        if key not in aggregated_data:
-            aggregated_data[key] = 0
-        aggregated_data[key] += row['amount']
-    
-    # STEP 5: SCAN the FUTURE sheet to understand its structure
-    update_status("Scanning FUTURE sheet structure...")
-    
-    future_sheet = workbook["FUTURE"]
-    
-    # Scan for CCs in column C (the only fixed structure requirement)
-    cc_rows = {}  # Maps CC to its row number
-    cc_sections = {}  # Maps CC to its section (start row, end row)
-    
-    # Look through all rows for numeric values in column C
-    for row_num in range(1, future_sheet.max_row + 1):
-        cc_value = future_sheet.cell(row=row_num, column=3).value
-        
-        # Check if the value is a number (could be int or float)
-        if cc_value is not None and isinstance(cc_value, (int, float)) and not isinstance(cc_value, str):
-            # Look at cells to the right to confirm it's a header row (usually contains month names)
-            has_data_to_right = False
-            for col_num in range(4, min(future_sheet.max_column + 1, 15)):  # Check up to 10 columns to the right
-                if future_sheet.cell(row=row_num, column=col_num).value:
-                    has_data_to_right = True
-                    break
-            
-            if has_data_to_right:
-                cc_rows[str(int(cc_value))] = row_num
-    
-    update_status(f"Found {len(cc_rows)} cost centers in FUTURE sheet")
-    
-    # For each CC, scan for tag rows and months
-    future_structure = {}
-    future_months = []
-    
-    for cc, row_num in cc_rows.items():
-        # First, find all months in the header row
-        month_cols = {}  # Maps month to its column number
-        col_num = 4  # Start from column D
-        blank_count = 0
-        
-        while col_num <= future_sheet.max_column and blank_count < 10:
-            month_value = future_sheet.cell(row=row_num, column=col_num).value
-            
-            if month_value is None:
-                blank_count += 1
-            else:
-                blank_count = 0  # Reset blank count when we find a value
-                if month_value != "Blabla":  # Skip Blabla columns
-                    month_cols[month_value] = col_num
-                    if month_value not in future_months:
-                        future_months.append(month_value)
-            
-            col_num += 1
-        
-        # Now scan rows below this CC for tags
-        tag_rows = []  # List of (tag, row_number) tuples
-        current_row = row_num + 1
-        blank_count = 0
-        max_blanks = 3  # Stop after 3 blank rows
-        
-        while current_row <= future_sheet.max_row and blank_count < max_blanks:
-            tag_value = future_sheet.cell(row=current_row, column=3).value
-            
-            if tag_value is None:
-                blank_count += 1
-            elif isinstance(tag_value, str):
-                # Found a tag row - must be a string and not a number
-                if not isinstance(tag_value, (int, float)) and not tag_value.isdigit():
-                    tag_rows.append((tag_value, current_row))
-                blank_count = 0  # Reset blank counter
-            
-            current_row += 1
-        
-        future_structure[cc] = {
-            "header_row": row_num,
-            "tag_rows": tag_rows,
-            "month_cols": month_cols
-        }
-    
-    update_status(f"Found {len(future_months)} months in FUTURE sheet")
-    
-    # STEP 6: Update the FUTURE sheet based on scanned structure
-    update_status("Updating FUTURE sheet with processed data...")
-    
-    # For each CC section, update the values for each tag and month
-    for cc, section in future_structure.items():
-        for tag, row_num in section["tag_rows"]:
-            # Get the correct future tag if mapped
-            for month, col_num in section["month_cols"].items():
-                # Look for the aggregated value
-                key = (cc, tag, month)
-                if key in aggregated_data:
-                    value = aggregated_data[key]
-                    future_sheet.cell(row=row_num, column=col_num, value=value)
-                else:
-                    # If no value found, leave as is or clear
-                    # future_sheet.cell(row=row_num, column=col_num, value="")
-                    pass
-    
-    # STEP 7: Create or update the LOGS sheet structure
-    
-    # Ensure "LOGS >>" sheet exists (create if not)
-    logs_sheet_name = "LOGS >>"
-    if logs_sheet_name not in workbook.sheetnames:
-        workbook.create_sheet(logs_sheet_name)
-        update_status(f"Created {logs_sheet_name} sheet")
-    
-    # Create or reset FutureLog sheet after "LOGS >>" sheet
-    future_log_name = "FutureLog"
-    if future_log_name in workbook.sheetnames:
-        # Remove existing sheet
-        del workbook[future_log_name]
-    
-    # Create new FutureLog sheet after LOGS >>
-    logs_index = workbook.sheetnames.index(logs_sheet_name)
-    future_log = workbook.create_sheet(future_log_name, logs_index + 1)
-    
-    # Add headers to FutureLog
-    log_headers = [
-        "Timestamp", 
-        "Process Type", 
-        "Accounts Processed", 
-        "Unmapped Accounts", 
-        "CCs Processed", 
-        "Months Processed", 
-        "Status"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('xav_processor_detailed.log'),
+        logging.StreamHandler(sys.stdout)
     ]
-    
-    for col_idx, header in enumerate(log_headers, start=1):
-        future_log.cell(row=1, column=col_idx, value=header)
-    
-    # Add processing summary
-    timestamp = datetime.now().isoformat()
-    future_log.cell(row=2, column=1, value=timestamp)
-    future_log.cell(row=2, column=2, value="XAV to FUTURE")
-    future_log.cell(row=2, column=3, value=len(processed_data))
-    future_log.cell(row=2, column=4, value=len(unmapped_accounts))
-    future_log.cell(row=2, column=5, value=len(cc_rows))
-    future_log.cell(row=2, column=6, value=len(future_months))
-    future_log.cell(row=2, column=7, value="Success")
-    
-    update_status(f"Updated {future_log_name} with processing summary")
-    
-    # STEP 8: Handle unmapped accounts (create processlogFuture if needed)
-    if unmapped_accounts:
-        update_status("Creating processlogFuture for unmapped accounts...")
-        
-        # Create processlogFuture sheet
-        process_log_name = "processlogFuture"
-        log_headers = ["Timestamp", "Account", "Period", "CC", "Amount", "Error"]
-        
-        if process_log_name in workbook.sheetnames:
-            # Remove existing sheet
-            del workbook[process_log_name]
-        
-        # Create new sheet after FutureLog
-        logs_index = workbook.sheetnames.index(future_log_name)
-        processlogFuture = workbook.create_sheet(process_log_name, logs_index + 1)
-        
-        # Add headers
-        for col_idx, header in enumerate(log_headers, start=1):
-            processlogFuture.cell(row=1, column=col_idx, value=header)
-        
-        # Add unmapped accounts
-        for row_idx, item in enumerate(unmapped_accounts, start=2):
-            timestamp = datetime.now().isoformat()
-            processlogFuture.cell(row=row_idx, column=1, value=timestamp)
-            processlogFuture.cell(row=row_idx, column=2, value=item['account'])
-            processlogFuture.cell(row=row_idx, column=3, value=item['period'])
-            processlogFuture.cell(row=row_idx, column=4, value=item['cc'])
-            processlogFuture.cell(row=row_idx, column=5, value=item['amount'])
-            processlogFuture.cell(row=row_idx, column=6, value="Account mapping not found")
-        
-        update_status(f"Created {process_log_name} with {len(unmapped_accounts)} unmapped accounts")
-    
-    # STEP 9: Save the workbook
-    update_status(f"Saving updated workbook to {output_file}...")
-    workbook.save(output_file)
-    
-    update_status("Processing completed successfully!")
-    return output_file
+)
+logger = logging.getLogger(__name__)
 
+def process_xav_data(input_file, output_file=None, selected_periods=None, status_callback=None):
+
+    def log_message(msg, level='INFO'):
+
+        if status_callback:
+            status_callback(msg)
+        
+        if level == 'DEBUG':
+            logger.debug(msg)
+        elif level == 'WARNING':
+            logger.warning(msg)
+        elif level == 'ERROR':
+            logger.error(msg)
+        else:
+            logger.info(msg)
+        
+        print(msg)
+    
+    try:
+
+        if output_file is None:
+            base, ext = os.path.splitext(input_file)
+            output_file = f"{base} - Processed{ext}"
+        
+        log_message(f"Processing file: {input_file}")
+        log_message(f"Output will be saved to: {output_file}")
+        
+        if selected_periods:
+            log_message(f"Selected periods: {', '.join(selected_periods)}")
+        
+        log_message("Loading Excel workbook...")
+        wb = openpyxl.load_workbook(input_file)
+        
+        log_message(f"Workbook contains sheets: {wb.sheetnames}")
+        
+        required_sheets = ["XAV Extract", "Account Mapping", "Reference Mapping", "FUTURE"]
+        missing = [sh for sh in required_sheets if sh not in wb.sheetnames]
+        if missing:
+            error_msg = f"Missing required sheets: {', '.join(missing)}"
+            log_message(error_msg, 'ERROR')
+            raise ValueError(error_msg)
+        
+        log_message("STEP 1: Reading XAV Extract sheet...", 'INFO')
+        xav_sheet = wb["XAV Extract"]
+        log_message(f"XAV Extract sheet has {xav_sheet.max_row} rows and {xav_sheet.max_column} columns")
+        
+        period_col = None
+        account_col = None
+        cc_col = None
+        amount_col = None
+        
+        for row_idx in range(1, min(5, xav_sheet.max_row + 1)):
+            log_message(f"Scanning row {row_idx} for headers...")
+            for cell in xav_sheet[row_idx]:
+                if cell.value is not None:
+                    cell_val = str(cell.value).strip()
+                    if cell_val == "Period":
+                        period_col = cell.column_letter
+                        log_message(f"Found 'Period' header in column {period_col}")
+                    elif cell_val == "Nat Account":
+                        account_col = cell.column_letter
+                        log_message(f"Found 'Nat Account' header in column {account_col}")
+                    elif cell_val == "CC":
+                        cc_col = cell.column_letter
+                        log_message(f"Found 'CC' header in column {cc_col}")
+                    elif cell_val == "Amount":
+                        amount_col = cell.column_letter
+                        log_message(f"Found 'Amount' header in column {amount_col}")
+        
+        if not all([period_col, account_col, cc_col, amount_col]):
+            missing_cols = []
+            if not period_col:
+                missing_cols.append("Period")
+            if not account_col:
+                missing_cols.append("Nat Account")
+            if not cc_col:
+                missing_cols.append("CC")
+            if not amount_col:
+                missing_cols.append("Amount")
+                
+            error_msg = f"Could not find all required columns in XAV Extract: {', '.join(missing_cols)}"
+            log_message(error_msg, 'ERROR')
+            raise ValueError(error_msg)
+        
+        xav_data = []
+        start_row = max(row for row in range(1, 5) if 
+                        "Period" in [str(cell.value).strip() if cell.value else "" for cell in xav_sheet[row]])
+        start_row += 1  
+        
+        log_message(f"Reading data starting from row {start_row}")
+        
+        for row in range(start_row, xav_sheet.max_row + 1):
+            period = xav_sheet[f"{period_col}{row}"].value
+            account = xav_sheet[f"{account_col}{row}"].value
+            cc = xav_sheet[f"{cc_col}{row}"].value
+            amount = xav_sheet[f"{amount_col}{row}"].value
+            
+            if all(x is None for x in [period, account, cc, amount]):
+                continue
+        
+            if any(x is None for x in [period, account, cc, amount]):
+                log_message(f"Row {row} has missing values, skipping: Period={period}, Account={account}, CC={cc}, Amount={amount}", 'WARNING')
+                continue
+            
+            try:
+                amount_val = float(amount)
+                account_val = str(account)
+                cc_val = str(cc)
+                period_val = str(period)
+                
+                xav_data.append({
+                    "Period": period_val,
+                    "Nat Account": account_val,
+                    "CC": cc_val,
+                    "Amount": amount_val
+                })
+                
+                log_message(f"Read row {row}: Period={period_val}, Account={account_val}, CC={cc_val}, Amount={amount_val}", 'DEBUG')
+            except Exception as e:
+                log_message(f"Error converting row {row}: {str(e)}", 'WARNING')
+        
+        log_message(f"Read {len(xav_data)} valid rows from XAV Extract")
+        
+        log_message("STEP 2: Reading Account Mapping sheet...", 'INFO')
+        acctmap_sheet = wb["Account Mapping"]
+        log_message(f"Account Mapping sheet has {acctmap_sheet.max_row} rows and {acctmap_sheet.max_column} columns")
+        
+        acct_col = None
+        tag_col = None
+        
+        for row_idx in range(1, min(5, acctmap_sheet.max_row + 1)):
+            log_message(f"Scanning row {row_idx} for headers...")
+            for cell in acctmap_sheet[row_idx]:
+                if cell.value is not None:
+                    cell_val = str(cell.value).strip()
+                    if cell_val == "Account":
+                        acct_col = cell.column_letter
+                        log_message(f"Found 'Account' column at {acct_col}")
+                    elif cell_val == "REPORT 2":
+                        tag_col = cell.column_letter
+                        log_message(f"Found 'REPORT 2' column at {tag_col}")
+        
+        if not acct_col or not tag_col:
+            error_msg = "Could not find 'Account' or 'REPORT 2' columns in Account Mapping"
+            log_message(error_msg, 'ERROR')
+            raise ValueError(error_msg)
+        
+        start_row = max(row for row in range(1, 5) if 
+                        "Account" in [str(cell.value).strip() if cell.value else "" for cell in acctmap_sheet[row]])
+        start_row += 1
+        
+        account_to_tag = {}
+        log_message(f"Reading account mappings from row {start_row}")
+        
+        for row in range(start_row, acctmap_sheet.max_row + 1):
+            acct_val = acctmap_sheet[f"{acct_col}{row}"].value
+            tag_val = acctmap_sheet[f"{tag_col}{row}"].value
+            
+            if acct_val is None:
+                continue
+                
+            if acct_val is not None and tag_val is not None:
+                account_to_tag[str(acct_val)] = str(tag_val).strip()
+                log_message(f"Account mapping: {acct_val} -> {tag_val.strip() if isinstance(tag_val, str) else tag_val}", 'DEBUG')
+        
+        log_message(f"Found {len(account_to_tag)} account-to-tag mappings")
+        for acct, tag in account_to_tag.items():
+            log_message(f"  Account '{acct}' maps to tag '{tag}'", 'DEBUG')
+        
+        log_message("STEP 3: Reading Reference Mapping sheet...", 'INFO')
+        ref_sheet = wb["Reference Mapping"]
+        log_message(f"Reference Mapping sheet has {ref_sheet.max_row} rows and {ref_sheet.max_column} columns")
+        
+        xav_month_col = None
+        actual_month_col = None
+        
+        for row_idx in range(1, min(10, ref_sheet.max_row + 1)):
+            log_message(f"Scanning row {row_idx} for period mapping headers...")
+            for cell in ref_sheet[row_idx]:
+                if cell.value is not None:
+                    cell_val = str(cell.value).strip()
+                    if "XAV" in cell_val and "Month" in cell_val:
+                        xav_month_col = cell.column_letter
+                        log_message(f"Found XAV Month column: '{cell_val}' at {cell.column_letter}")
+                    elif "Actual" in cell_val and "Month" in cell_val:
+                        actual_month_col = cell.column_letter
+                        log_message(f"Found Actual Month column: '{cell_val}' at {cell.column_letter}")
+        
+        period_to_month = {}
+        
+        if xav_month_col and actual_month_col:
+            header_row = 0
+            for row in range(1, ref_sheet.max_row + 1):
+                cell_val = ref_sheet[f"{xav_month_col}{row}"].value
+                if cell_val and "XAV" in str(cell_val) and "Month" in str(cell_val):
+                    header_row = row
+                    break
+            
+            start_row = header_row + 1
+            log_message(f"Reading period mappings from row {start_row}")
+            
+            for row in range(start_row, ref_sheet.max_row + 1):
+                xav_val = ref_sheet[f"{xav_month_col}{row}"].value
+                actual_val = ref_sheet[f"{actual_month_col}{row}"].value
+                
+                if not xav_val or not actual_val:
+                    continue
+                
+                period_to_month[str(xav_val).strip()] = str(actual_val).strip()
+                log_message(f"Period mapping: {xav_val.strip() if isinstance(xav_val, str) else xav_val} -> {actual_val.strip() if isinstance(actual_val, str) else actual_val}", 'DEBUG')
+        else:
+            log_message("Could not find period mapping columns - will use original periods", 'WARNING')
+        
+        log_message(f"Found {len(period_to_month)} period-to-month mappings")
+        for period, month in period_to_month.items():
+            log_message(f"  Period '{period}' maps to month '{month}'", 'DEBUG')
+        
+        tag_to_future = {}
+        found_tag_section = False
+        
+        i2_val = ref_sheet.cell(row=2, column=9).value
+        j2_val = ref_sheet.cell(row=2, column=10).value
+        
+        if i2_val == "Account Mapping" and j2_val == "FUTURE":
+            found_tag_section = True
+            log_message(f"Found Account Mapping to FUTURE section at I2/J2")
+            
+            start_row = 3 
+            
+            for r in range(start_row, ref_sheet.max_row + 1):
+                tag_val = ref_sheet.cell(row=r, column=9).value  
+                future_val = ref_sheet.cell(row=r, column=10).value  
+                
+                if not tag_val or not future_val:
+                    continue 
+                    
+                tag_to_future[str(tag_val).strip()] = str(future_val).strip()
+                log_message(f"Tag mapping: {tag_val.strip() if isinstance(tag_val, str) else tag_val} -> {future_val.strip() if isinstance(future_val, str) else future_val}", 'DEBUG')
+        else:
+
+            for row in range(1, ref_sheet.max_row + 1):
+                for col in range(1, ref_sheet.max_column):
+                    c_val = ref_sheet.cell(row=row, column=col).value
+                    d_val = ref_sheet.cell(row=row, column=col+1).value
+                    
+                    if c_val == "Account Mapping" and d_val == "FUTURE":
+                        found_tag_section = True
+                        log_message(f"Found Account Mapping to FUTURE section at row {row}, column {col}")
+                        
+                        r = row + 1
+                        while r <= ref_sheet.max_row:
+                            tag_val = ref_sheet.cell(row=r, column=col).value
+                            future_val = ref_sheet.cell(row=r, column=col+1).value
+                            
+                            if not tag_val or not future_val:
+                                r += 1
+                                continue
+                                
+                            tag_to_future[str(tag_val).strip()] = str(future_val).strip()
+                            log_message(f"Tag mapping: {tag_val.strip() if isinstance(tag_val, str) else tag_val} -> {future_val.strip() if isinstance(future_val, str) else future_val}", 'DEBUG')
+                            r += 1
+                        break
+                if found_tag_section:
+                    break
+        
+        if not found_tag_section:
+            log_message("Could not find tag->FUTURE mapping section - will use original tags", 'WARNING')
+        
+        log_message(f"Found {len(tag_to_future)} tag-to-FUTURE mappings")
+        for tag, future in tag_to_future.items():
+            log_message(f"  Tag '{tag}' maps to FUTURE tag '{future}'", 'DEBUG')
+        
+        log_message("STEP 4: Processing XAV data...", 'INFO')
+        processed_rows = []
+        unmapped_accounts = []
+        
+        for idx, row in enumerate(xav_data):
+            period = row["Period"].strip()
+            account = row["Nat Account"]
+            cc = row["CC"]
+            amount = row["Amount"]
+            
+            log_message(f"Processing row {idx+1}: Period={period}, Account={account}, CC={cc}, Amount={amount}", 'DEBUG')
+            
+            if selected_periods:
+                mapped_month = period_to_month.get(period, period).strip()
+                if mapped_month not in selected_periods:
+                    log_message(f"  Skipping period {period} (mapped to {mapped_month}) - not in selected periods", 'DEBUG')
+                    continue
+            
+            if account not in account_to_tag:
+                log_message(f"Account {account} not found in mapping!", 'WARNING')
+                unmapped_accounts.append({
+                    "Nat Account": account,
+                    "Period": period,
+                    "CC": cc,
+                    "Amount": amount
+                })
+                continue
+            
+            tag = account_to_tag[account]
+            future_tag = tag_to_future.get(tag, tag) 
+            
+            log_message(f"  Account {account} -> Tag {tag} -> Future Tag {future_tag}", 'DEBUG')
+            
+            month = period_to_month.get(period, period) 
+            log_message(f"  Period {period} -> Month {month}", 'DEBUG')
+            
+            processed_rows.append({
+                "CC": cc,
+                "Tag": future_tag,
+                "Month": month,
+                "Amount": amount
+            })
+        
+        log_message(f"Processed {len(processed_rows)} rows; {len(unmapped_accounts)} unmapped accounts")
+        
+        if not processed_rows:
+            log_message("No rows to aggregate!", 'WARNING')
+            df_agg = pd.DataFrame(columns=["CC", "Tag", "Month", "Amount"])
+        else:
+            df_proc = pd.DataFrame(processed_rows)
+            log_message(f"Created DataFrame with columns: {df_proc.columns.tolist()}")
+            log_message(f"Data types: {df_proc.dtypes}")
+            
+            df_agg = df_proc.groupby(["CC", "Tag", "Month"], as_index=False)["Amount"].sum()
+            log_message(f"Aggregated to {len(df_agg)} unique combinations")
+            
+            for _, row in df_agg.iterrows():
+                log_message(f"Aggregated: CC={row['CC']}, Tag={row['Tag']}, Month={row['Month']}, Amount={row['Amount']}", 'DEBUG')
+        
+        log_message("STEP 5: Analyzing FUTURE sheet structure...", 'INFO')
+        future_sheet = wb["FUTURE"]
+        log_message(f"FUTURE sheet has {future_sheet.max_row} rows and {future_sheet.max_column} columns")
+        
+        log_message("Dumping FUTURE sheet structure (first 10 rows):")
+        for row in range(1, min(11, future_sheet.max_row + 1)):
+            row_data = []
+            for col in range(1, min(6, future_sheet.max_column + 1)):
+                cell_val = future_sheet.cell(row=row, column=col).value
+                row_data.append(str(cell_val) if cell_val is not None else "None")
+            log_message(f"  Row {row}: {', '.join(row_data)}")
+        
+        cc_rows = {} 
+        
+        cc_col = 3  
+        
+        for row in range(1, min(30, future_sheet.max_row + 1)):
+            cc_val = future_sheet.cell(row=row, column=cc_col).value
+            
+            if cc_val is not None:
+                log_message(f"Row {row}, Col {cc_col}: Found value '{cc_val}'", 'DEBUG')
+                
+                try:
+                    cc_num = int(float(cc_val))
+                    cc_rows[str(cc_num)] = row
+                    log_message(f"Found CC {cc_num} at row {row}")
+                except (ValueError, TypeError):
+                    pass
+        
+        log_message(f"Found {len(cc_rows)} CC rows")
+        for cc, row in cc_rows.items():
+            log_message(f"  CC {cc} is at row {row}")
+        
+        month_header_row = None
+        if cc_rows:
+            month_header_row = min(cc_rows.values())
+            log_message(f"Using row {month_header_row} for month headers")
+        else:
+
+            month_header_row = 1
+            log_message("No CC rows found - using row 1 for month headers", 'WARNING')
+        
+        month_cols = {} 
+        
+
+        for col in range(4, future_sheet.max_column + 1):
+            month_val = future_sheet.cell(row=month_header_row, column=col).value
+            
+            if month_val:
+
+                month_str = str(month_val).strip()
+                month_cols[month_str] = col
+                log_message(f"Found month '{month_str}' at column {col}")
+        
+        log_message(f"Found {len(month_cols)} month columns")
+        for month, col in month_cols.items():
+            log_message(f"  Month '{month}' is at column {col}")
+        
+        cc_tag_rows = {}
+        
+        for cc, cc_row in cc_rows.items():
+            log_message(f"Scanning for tags under CC {cc} (row {cc_row})...")
+            
+            row = cc_row + 1
+            while row <= future_sheet.max_row:
+                tag_val = future_sheet.cell(row=row, column=cc_col).value
+                
+                if tag_val is None:
+                    row += 1
+                    continue
+                
+                try:
+                    int(float(tag_val))
+                    break
+                except (ValueError, TypeError):
+
+                    tag_str = str(tag_val).strip()
+                    cc_tag_rows[(cc, tag_str)] = row
+                    log_message(f"  Found tag '{tag_str}' at row {row}")
+                    row += 1
+        
+        log_message(f"Found {len(cc_tag_rows)} CC-tag combinations")
+        for (cc, tag), row in cc_tag_rows.items():
+            log_message(f"  CC {cc}, Tag '{tag}' is at row {row}")
+        
+        log_message("STEP 6: Updating FUTURE sheet...", 'INFO')
+        updates_made = 0
+        updates_failed = 0
+        
+        missing_cc_tag_combos = []
+        missing_months = []
+        
+        for _, row in df_agg.iterrows():
+            cc = row["CC"]
+            tag = row["Tag"].strip()  
+            month = row["Month"].strip() 
+            amount = row["Amount"]
+            
+            log_message(f"Looking to update: CC={cc}, Tag='{tag}', Month='{month}', Amount={amount}", 'DEBUG')
+            
+            if (cc, tag) in cc_tag_rows and month in month_cols:
+                cell_row = cc_tag_rows[(cc, tag)]
+                cell_col = month_cols[month]
+            
+                current_val = future_sheet.cell(row=cell_row, column=cell_col).value
+                log_message(f"  Found cell at row {cell_row}, col {cell_col}, current value: {current_val}")
+                
+                future_sheet.cell(row=cell_row, column=cell_col).value = amount
+                updates_made += 1
+                log_message(f"  Updated cell: current={current_val}, new={amount}")
+            else:
+                updates_failed += 1
+                if (cc, tag) not in cc_tag_rows:
+                    missing_cc_tag_combos.append((cc, tag))
+                    cc_exists = cc in [c for c, _ in cc_tag_rows.keys()]
+                    if cc_exists:
+                        avail_tags = [t for c, t in cc_tag_rows.keys() if c == cc]
+                        similar_tags = [t for t in avail_tags if t.replace(' ', '') == tag.replace(' ', '')]
+                        
+                        if similar_tags:
+                            log_message(f"  Tag '{tag}' not found for CC {cc}, but similar tags exist: {similar_tags}", 'WARNING')
+                            for sim_tag in similar_tags:
+                                if (cc, sim_tag) in cc_tag_rows and month in month_cols:
+                                    cell_row = cc_tag_rows[(cc, sim_tag)]
+                                    cell_col = month_cols[month]
+                                    current_val = future_sheet.cell(row=cell_row, column=cell_col).value
+                                    future_sheet.cell(row=cell_row, column=cell_col).value = amount
+                                    updates_made += 1
+                                    updates_failed -= 1
+                                    log_message(f"  Used similar tag '{sim_tag}' instead of '{tag}' - updated cell at row {cell_row}, col {cell_col}", 'INFO')
+                                    break
+                        else:
+                            log_message(f"  Tag '{tag}' not found for CC {cc}. Available tags: {avail_tags}", 'WARNING')
+                    else:
+                        log_message(f"  CC {cc} not found in FUTURE sheet", 'WARNING')
+                
+                if month not in month_cols:
+                    missing_months.append(month)
+                    similar_months = [m for m in month_cols.keys() 
+                                    if m.replace(' ', '').lower() == month.replace(' ', '').lower()]
+                    
+                    if similar_months:
+                        log_message(f"  Month '{month}' not found, but similar months exist: {similar_months}", 'WARNING')
+                        for sim_month in similar_months:
+                            if (cc, tag) in cc_tag_rows and sim_month in month_cols:
+                                cell_row = cc_tag_rows[(cc, tag)]
+                                cell_col = month_cols[sim_month]
+                                current_val = future_sheet.cell(row=cell_row, column=cell_col).value
+                                future_sheet.cell(row=cell_row, column=cell_col).value = amount
+                                updates_made += 1
+                                updates_failed -= 1
+                                log_message(f"  Used similar month '{sim_month}' instead of '{month}' - updated cell at row {cell_row}, col {cell_col}", 'INFO')
+                                break
+                    else:
+                        log_message(f"  Month '{month}' not found in FUTURE sheet. Available months: {list(month_cols.keys())}", 'WARNING')
+        
+        log_message(f"Made {updates_made} updates, {updates_failed} failed")
+        
+        if missing_cc_tag_combos:
+            unique_combos = list(set(missing_cc_tag_combos))
+            log_message(f"Missing CC-tag combinations ({len(unique_combos)}):")
+            for cc, tag in unique_combos:
+                log_message(f"  CC={cc}, Tag='{tag}'")
+        
+        if missing_months:
+            unique_months = list(set(missing_months))
+            log_message(f"Missing months ({len(unique_months)}):")
+            for month in unique_months:
+                log_message(f"  '{month}'")
+
+                similar = [m for m in month_cols.keys() if month.lower() in m.lower() or m.lower() in month.lower()]
+                if similar:
+                    log_message(f"  - Similar months found: {similar}")
+        
+        log_message("STEP 7: Creating log sheets...", 'INFO')
+        
+        logs_sheet_name = "LOGS >>"
+        if logs_sheet_name not in wb.sheetnames:
+            wb.create_sheet(logs_sheet_name)
+            log_message(f"Created sheet '{logs_sheet_name}'")
+        
+        future_log_name = "FutureLog"
+        if future_log_name in wb.sheetnames:
+            del wb[future_log_name]
+            log_message(f"Replaced existing '{future_log_name}' sheet")
+        
+        logs_index = wb.sheetnames.index(logs_sheet_name)
+        future_log = wb.create_sheet(future_log_name, logs_index + 1)
+        
+        headers = [
+            "Timestamp", "Process Type", "Rows Processed", 
+            "Unmapped Accounts", "Updates Made", "Failed Updates", 
+            "Missing CC-Tags", "Missing Months", "Status"
+        ]
+        for i, h in enumerate(headers, start=1):
+            future_log.cell(row=1, column=i, value=h)
+        
+        time_now = datetime.now().isoformat()
+        future_log.cell(row=2, column=1, value=time_now)
+        future_log.cell(row=2, column=2, value="XAV to FUTURE")
+        future_log.cell(row=2, column=3, value=len(processed_rows))
+        future_log.cell(row=2, column=4, value=len(unmapped_accounts))
+        future_log.cell(row=2, column=5, value=updates_made)
+        future_log.cell(row=2, column=6, value=updates_failed)
+        future_log.cell(row=2, column=7, value=len(set(missing_cc_tag_combos)))
+        future_log.cell(row=2, column=8, value=len(set(missing_months)))
+        future_log.cell(row=2, column=9, value="Success")
+        
+        if unmapped_accounts:
+            plog_name = "processlogFuture"
+            if plog_name in wb.sheetnames:
+                del wb[plog_name]
+                log_message(f"Replaced existing '{plog_name}' sheet")
+            
+            plog = wb.create_sheet(plog_name, logs_index + 2)
+            
+            headers = ["Timestamp", "Nat Account", "Period", "CC", "Amount", "Reason"]
+            for i, h in enumerate(headers, start=1):
+                plog.cell(row=1, column=i, value=h)
+            
+            for i, unmapped in enumerate(unmapped_accounts, start=2):
+                plog.cell(row=i, column=1, value=time_now)
+                plog.cell(row=i, column=2, value=unmapped["Nat Account"])
+                plog.cell(row=i, column=3, value=unmapped["Period"])
+                plog.cell(row=i, column=4, value=unmapped["CC"])
+                plog.cell(row=i, column=5, value=unmapped["Amount"])
+                plog.cell(row=i, column=6, value="No Account Mapping Found")
+            
+            log_message(f"Created '{plog_name}' with {len(unmapped_accounts)} unmapped accounts")
+        
+        if updates_failed > 0:
+            flog_name = "FailureLog"
+            if flog_name in wb.sheetnames:
+                del wb[flog_name]
+            
+            flog = wb.create_sheet(flog_name, logs_index + 3)
+
+            headers = ["Type", "Value", "Reason", "Available Options"]
+            for i, h in enumerate(headers, start=1):
+                flog.cell(row=1, column=i, value=h)
+            
+            row_idx = 2
+            for cc, tag in set(missing_cc_tag_combos):
+                flog.cell(row=row_idx, column=1, value="CC-Tag")
+                flog.cell(row=row_idx, column=2, value=f"CC={cc}, Tag={tag}")
+                
+                if cc not in [c for c, _ in cc_tag_rows.keys()]:
+                    reason = f"CC {cc} not found in FUTURE sheet"
+                    options = "Add the Cost Center to FUTURE sheet"
+                else:
+                    reason = f"Tag '{tag}' not found under CC {cc}"
+                    avail_tags = [t for c, t in cc_tag_rows.keys() if c == cc]
+                    options = f"Available tags: {', '.join(avail_tags)}"
+                
+                flog.cell(row=row_idx, column=3, value=reason)
+                flog.cell(row=row_idx, column=4, value=options)
+                row_idx += 1
+            
+            for month in set(missing_months):
+                flog.cell(row=row_idx, column=1, value="Month")
+                flog.cell(row=row_idx, column=2, value=month)
+                flog.cell(row=row_idx, column=3, value=f"Month '{month}' not found in FUTURE sheet")
+    
+                similar = [m for m in month_cols.keys() if month.lower() in m.lower() or m.lower() in month.lower()]
+                if similar:
+                    options = f"Similar months: {', '.join(similar)}"
+                else:
+                    options = f"Available months: {', '.join(list(month_cols.keys()))}"
+                
+                flog.cell(row=row_idx, column=4, value=options)
+                row_idx += 1
+            
+            log_message(f"Created '{flog_name}' with details on {row_idx-2} failures")
+        
+        log_message("STEP 8: Saving workbook...", 'INFO')
+        try:
+            wb.save(output_file)
+            log_message(f"Successfully saved workbook to {output_file}")
+        except Exception as e:
+            log_message(f"Error saving workbook: {str(e)}", 'ERROR')
+            raise
+        
+        log_message("Processing completed successfully!")
+        return output_file
+        
+    except Exception as e:
+        error_msg = f"Error: {str(e)}"
+        log_message(error_msg, 'ERROR')
+        logger.exception("Exception details")
+        raise
+
+class PeriodSelector(simpledialog.Dialog):
+    def __init__(self, parent, title, periods):
+        self.periods = periods
+        self.selected_periods = []
+        super().__init__(parent, title)
+    
+    def body(self, frame):
+        ttk.Label(frame, text="Select periods to process:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL)
+        self.listbox = Listbox(frame, selectmode=MULTIPLE, height=10, width=40, 
+                              yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.listbox.yview)
+        
+        self.listbox.grid(row=1, column=0, sticky=tk.NSEW)
+        scrollbar.grid(row=1, column=1, sticky=tk.NS)
+        
+        for period in self.periods:
+            self.listbox.insert(tk.END, period)
+        
+        for i in range(len(self.periods)):
+            self.listbox.selection_set(i)
+        
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=5)
+        
+        ttk.Button(btn_frame, text="Select All", command=self.select_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Deselect All", command=self.deselect_all).pack(side=tk.LEFT)
+        
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        
+        return self.listbox 
+    
+    def select_all(self):
+        self.listbox.selection_set(0, tk.END)
+    
+    def deselect_all(self):
+        self.listbox.selection_clear(0, tk.END)
+    
+    def apply(self):
+        selection = self.listbox.curselection()
+        self.selected_periods = [self.periods[int(i)] for i in selection]
 
 class XAVProcessorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("XAV to FUTURE Processor")
-        self.root.geometry("700x600")
-        self.root.resizable(True, True)
-        
-        # Create a frame for the file selection
-        file_frame = ttk.Frame(root, padding="10")
-        file_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        # File selection
-        ttk.Label(file_frame, text="Select XAV Excel File:").grid(column=0, row=0, sticky=tk.W, pady=5)
+        self.root.geometry("800x600")
         
         self.file_path = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.file_path, width=50).grid(column=0, row=1, sticky=(tk.W, tk.E), pady=5)
+        self.selected_periods = None
         
-        ttk.Button(file_frame, text="Browse...", command=self.browse_file).grid(column=1, row=1, padx=5, pady=5)
+        main_frame = ttk.Frame(root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Period selection frame (initially hidden)
-        self.period_frame = ttk.LabelFrame(root, text="Select Periods to Update", padding="10")
+        title_label = ttk.Label(
+            main_frame, 
+            text="XAV to FUTURE Processor", 
+            font=("Arial", 16, "bold")
+        )
+        title_label.pack(pady=(0, 20))
         
-        # Variable to hold selected periods
-        self.selected_periods = []
-        self.period_vars = {}  # Will hold CheckButton variables
-        self.scan_done = False
+        instructions = (
+            "This tool processes XAV Extract data and updates the FUTURE sheet.\n"
+            "1. It maps accounts using the Account Mapping sheet.\n"
+            "2. It maps periods using the Reference Mapping sheet.\n"
+            "3. It aggregates data by cc, tag, and month.\n"
+            "4. It updates the FUTURE sheet with aggregated values."
+        )
+        ttk.Label(main_frame, text=instructions, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 15))
         
-        # Add a Scan button
-        ttk.Button(file_frame, text="Scan Periods", command=self.scan_periods).grid(column=0, row=2, sticky=tk.W, pady=5)
+        # File selection
+        file_frame = ttk.LabelFrame(main_frame, text="File Selection", padding="10")
+        file_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # Output file options
-        output_frame = ttk.Frame(root, padding="10")
-        output_frame.pack(fill=tk.X, padx=10, pady=0)
+        ttk.Label(file_frame, text="Select Excel File:").grid(row=0, column=0, sticky=tk.W, pady=5)
         
-        ttk.Label(output_frame, text="Output Options:").grid(column=0, row=0, sticky=tk.W, pady=5)
+        self.file_entry = ttk.Entry(file_frame, textvariable=self.file_path, width=60)
+        self.file_entry.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
         
-        self.output_same = tk.BooleanVar(value=True)
-        ttk.Radiobutton(output_frame, text="Create new file (original filename + ' - Processed')", 
-                        variable=self.output_same, value=True).grid(column=0, row=1, sticky=tk.W, pady=2)
+        ttk.Button(file_frame, text="Browse...", command=self.browse_file).grid(row=0, column=2, padx=5, pady=5)
         
-        ttk.Radiobutton(output_frame, text="Specify output file", 
-                        variable=self.output_same, value=False).grid(column=0, row=2, sticky=tk.W, pady=2)
+        file_frame.columnconfigure(1, weight=1)
         
-        self.output_path = tk.StringVar()
-        self.output_entry = ttk.Entry(output_frame, textvariable=self.output_path, width=50, state='disabled')
-        self.output_entry.grid(column=0, row=3, sticky=(tk.W, tk.E), pady=5)
+        options_frame = ttk.LabelFrame(main_frame, text="Options", padding="10")
+        options_frame.pack(fill=tk.X, pady=(0, 10))
         
-        self.browse_output_btn = ttk.Button(output_frame, text="Browse...", command=self.browse_output_file, state='disabled')
-        self.browse_output_btn.grid(column=1, row=3, padx=5, pady=5)
+        self.detailed_logging = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            options_frame, 
+            text="Enable detailed logging", 
+            variable=self.detailed_logging
+        ).pack(anchor=tk.W)
+
+        self.period_btn = ttk.Button(
+            options_frame,
+            text="Select Periods...",
+            command=self.select_periods,
+            state=tk.DISABLED
+        )
+        self.period_btn.pack(anchor=tk.W, pady=(5, 0))
         
-        # Bind change in radio buttons
-        self.output_same.trace_add("write", self.toggle_output_entry)
+        self.period_label = ttk.Label(options_frame, text="All periods will be processed")
+        self.period_label.pack(anchor=tk.W, pady=(5, 0))
         
-        # Create a frame for the process button
-        button_frame = ttk.Frame(root, padding="10")
-        button_frame.pack(fill=tk.X, padx=10, pady=0)
-        
-        self.process_btn = ttk.Button(button_frame, text="Process XAV Data", command=self.process_file, state='disabled')
+        self.process_btn = ttk.Button(
+            main_frame, 
+            text="Process File", 
+            command=self.process_file,
+            state=tk.DISABLED
+        )
         self.process_btn.pack(pady=10)
         
-        # Status frame
-        status_frame = ttk.LabelFrame(root, text="Processing Status", padding="10")
-        status_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.progress = ttk.Progressbar(
+            main_frame,
+            orient=tk.HORIZONTAL,
+            length=100,
+            mode='indeterminate'
+        )
         
-        # Status text widget
-        self.status_text = tk.Text(status_frame, wrap=tk.WORD, width=70, height=15)
+        status_frame = ttk.LabelFrame(main_frame, text="Processing Status", padding="10")
+        status_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        self.status_text = tk.Text(status_frame, wrap=tk.WORD, height=15)
         self.status_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # Add scrollbar
         scrollbar = ttk.Scrollbar(status_frame, orient=tk.VERTICAL, command=self.status_text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
         self.status_text.configure(yscrollcommand=scrollbar.set)
         
-        # Initial status
-        self.update_status("Ready to process XAV data. Please select an Excel file and scan for periods.")
+        self.status_text.insert(tk.END, "Ready to process. Please select an Excel file.\n")
+        self.status_text.config(state=tk.DISABLED)
+    
+    def update_status(self, msg):
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.insert(tk.END, f"{msg}\n")
+        self.status_text.see(tk.END)
+        self.status_text.config(state=tk.DISABLED)
+        self.root.update_idletasks()
+    
+    def browse_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Excel File",
+            filetypes=[("Excel Files", "*.xlsx *.xlsm *.xlsb *.xls")]
+        )
+        
+        if file_path:
+            self.file_path.set(file_path)
+            self.process_btn.configure(state=tk.NORMAL)
+            self.period_btn.configure(state=tk.NORMAL)
+            self.update_status(f"Selected file: {file_path}")
+            
+            # Reset selected periods
+            self.selected_periods = None
+            self.period_label.config(text="All periods will be processed")
+            
+            # Try to analyze available periods
+            self.analyze_periods(file_path)
+    
+    def analyze_periods(self, file_path):
+        try:
+            self.update_status("Analyzing available periods...")
+            
+            # Load workbook
+            wb = openpyxl.load_workbook(file_path, read_only=True)
+            
+            # Check for Reference Mapping sheet
+            if "Reference Mapping" not in wb.sheetnames:
+                self.update_status("Reference Mapping sheet not found - cannot analyze periods")
+                return
+            
+            # Try to find period mapping
+            ref_sheet = wb["Reference Mapping"]
+            
+            # Find columns for XAV Month and Actual Month
+            xav_month_col = None
+            actual_month_col = None
+            
+            # Scan first few rows for headers
+            for row_idx in range(1, min(10, ref_sheet.max_row + 1)):
+                for cell in ref_sheet[row_idx]:
+                    if cell.value is not None:
+                        cell_val = str(cell.value).strip()
+                        if "XAV" in cell_val and "Month" in cell_val:
+                            xav_month_col = cell.column
+                        elif "Actual" in cell_val and "Month" in cell_val:
+                            actual_month_col = cell.column
+            
+            if not xav_month_col or not actual_month_col:
+                self.update_status("Could not find period mapping columns")
+                return
+            
+            available_periods = []
+            header_row = 0
+            
+            # Find the header row
+            for row in range(1, min(10, ref_sheet.max_row + 1)):
+                cell_val = ref_sheet.cell(row=row, column=xav_month_col).value
+                if cell_val and "XAV" in str(cell_val) and "Month" in str(cell_val):
+                    header_row = row
+                    break
+            
+            if header_row == 0:
+                self.update_status("Could not find header row for periods")
+                return
+            
+            for row in range(header_row + 1, ref_sheet.max_row + 1):
+                actual_val = ref_sheet.cell(row=row, column=actual_month_col).value
+                if actual_val:
+                    period_str = str(actual_val).strip()
+                    if period_str:
+                        available_periods.append(period_str)
+            
+            if available_periods:
+                self.update_status(f"Found {len(available_periods)} available periods:")
+                self.update_status(", ".join(available_periods))
+        
+                self.available_periods = available_periods
+            else:
+                self.update_status("No periods found in Reference Mapping")
+        
+        except Exception as e:
+            self.update_status(f"Error analyzing periods: {str(e)}")
+    
+    def select_periods(self):
+        if hasattr(self, 'available_periods') and self.available_periods:
+            dialog = PeriodSelector(self.root, "Select Periods", self.available_periods)
+            if dialog.selected_periods:
+                self.selected_periods = dialog.selected_periods
+                if len(self.selected_periods) > 3:
+                    period_text = f"Selected {len(self.selected_periods)} periods"
+                else:
+                    period_text = f"Selected periods: {', '.join(self.selected_periods)}"
+                self.period_label.config(text=period_text)
+                self.update_status(f"Selected {len(self.selected_periods)} periods: {', '.join(self.selected_periods)}")
+            else:
+                self.selected_periods = None
+                self.period_label.config(text="All periods will be processed")
+                self.update_status("No periods selected - all periods will be processed")
+        else:
+            messagebox.showinfo("No Periods Found", "Could not find periods to select in the file.")
+    
+    def process_file(self):
+        input_file = self.file_path.get()
+        
+        if not input_file:
+            messagebox.showerror("Error", "Please select a file first")
+            return
+        
+        base, ext = os.path.splitext(input_file)
+        output_file = f"{base} - Processed{ext}"
+        
+        if os.path.exists(output_file):
+            overwrite = messagebox.askyesno(
+                "File Exists", 
+                f"The output file already exists:\n{output_file}\n\nDo you want to overwrite it?"
+            )
+            if not overwrite:
+                self.update_status("Processing cancelled - output file already exists")
+                return
+        
+        self.process_btn.configure(state=tk.DISABLED)
+        self.file_entry.configure(state=tk.DISABLED)
+        self.period_btn.configure(state=tk.DISABLED)
+        
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.delete(1.0, tk.END)
+        self.status_text.config(state=tk.DISABLED)
+        
+        self.progress.pack(fill=tk.X, pady=10)
+        self.progress.start()
+        
+        self.update_status(f"Processing file: {input_file}")
+        self.update_status(f"Output will be saved to: {output_file}")
+        
+        self.root.after(100, self.run_processing, input_file, output_file)
+    
+    def run_processing(self, input_file, output_file):
+        try:
+            result = process_xav_data(
+                input_file=input_file,
+                output_file=output_file,
+                selected_periods=self.selected_periods,
+                status_callback=self.update_status
+            )
+            
+            self.update_status("\nProcessing completed successfully!")
+            self.update_status(f"Output saved to: {result}")
+            
+            open_file = messagebox.askyesno(
+                "Processing Complete", 
+                f"Processing completed successfully!\n\nOutput saved to:\n{result}\n\nDo you want to open the file now?"
+            )
+            
+            if open_file:
+                import subprocess
+                import platform
+                
+                system = platform.system()
+                if system == 'Windows':
+                    os.startfile(result)
+        
+        except Exception as e:
+            self.update_status(f"ERROR: {str(e)}")
+            messagebox.showerror("Error", f"An error occurred during processing:\n\n{str(e)}")
+        
+        finally:
+            self.progress.stop()
+            self.progress.pack_forget()
+            self.process_btn.configure(state=tk.NORMAL)
+            self.file_entry.configure(state=tk.NORMAL)
+            self.period_btn.configure(state=tk.NORMAL)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = XAVProcessorApp(root)
+    root.mainloop()
