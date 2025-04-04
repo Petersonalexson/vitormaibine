@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import traceback
 
-def process_xav_data(input_file, output_file=None, status_callback=None):
+def process_xav_data(input_file, output_file=None, status_callback=None, selected_periods=None):
     """
     Process XAV Excel file and update the FUTURE sheet.
     
@@ -18,6 +18,7 @@ def process_xav_data(input_file, output_file=None, status_callback=None):
         output_file (str, optional): Path to save the output Excel file. 
                                     If None, will modify the input file name.
         status_callback (function, optional): Callback function to update status
+        selected_periods (list, optional): List of periods to process. If None, process all.
     
     Returns:
         str: Path to the output file
@@ -48,47 +49,159 @@ def process_xav_data(input_file, output_file=None, status_callback=None):
     update_status("Extracting data from required sheets...")
     
     # Get XAV Extract data
-    xav_data = pd.read_excel(input_file, sheet_name="XAV Extract")
+    xav_sheet = workbook["XAV Extract"]
+    
+    # Find headers in XAV Extract
+    period_col = None
+    account_col = None
+    cc_col = None
+    amount_col = None
+    
+    # Scan the first row to find column headers
+    for cell in xav_sheet[1]:
+        if cell.value == "Period":
+            period_col = cell.column_letter
+        elif cell.value == "Nat Account":
+            account_col = cell.column_letter
+        elif cell.value == "CC":
+            cc_col = cell.column_letter
+        elif cell.value == "Amount":
+            amount_col = cell.column_letter
+    
+    if not all([period_col, account_col, cc_col, amount_col]):
+        raise ValueError("Could not find all required columns in XAV Extract sheet")
+    
+    update_status(f"Found XAV Extract columns: Period={period_col}, Nat Account={account_col}, CC={cc_col}, Amount={amount_col}")
+    
+    # Read XAV data
+    xav_data = []
+    row_num = 2  # Start from row 2 (after header)
+    while True:
+        period = xav_sheet[f"{period_col}{row_num}"].value
+        account = xav_sheet[f"{account_col}{row_num}"].value
+        cc = xav_sheet[f"{cc_col}{row_num}"].value
+        amount = xav_sheet[f"{amount_col}{row_num}"].value
+        
+        # Stop when we hit a blank row
+        if period is None and account is None and cc is None and amount is None:
+            break
+        
+        if period and account and cc and amount:
+            xav_data.append({
+                "Period": period,
+                "Nat Account": str(account),
+                "CC": str(cc),
+                "Amount": float(amount)
+            })
+        
+        row_num += 1
+    
+    update_status(f"Read {len(xav_data)} rows from XAV Extract")
     
     # Get Account Mapping data
-    account_mapping = pd.read_excel(input_file, sheet_name="Account Mapping")
+    account_sheet = workbook["Account Mapping"]
     
-    # Get Reference Mapping data
-    ref_mapping_raw = pd.read_excel(input_file, sheet_name="Reference Mapping", header=None)
+    # Find headers in Account Mapping
+    account_col = None
+    report_col = None
     
-    # STEP 2: Create the necessary mappings
-    update_status("Creating data mappings...")
+    for cell in account_sheet[1]:
+        if cell.value == "Account":
+            account_col = cell.column_letter
+        elif cell.value == "REPORT 2":
+            report_col = cell.column_letter
     
-    # Create mapping from Account to Report Description (tag)
+    if not all([account_col, report_col]):
+        raise ValueError("Could not find all required columns in Account Mapping sheet")
+    
+    update_status(f"Found Account Mapping columns: Account={account_col}, REPORT 2={report_col}")
+    
+    # Read Account Mapping
     account_to_tag = {}
-    for _, row in account_mapping.iterrows():
-        if not pd.isna(row.get('Account')) and not pd.isna(row.get('Report Description')):
-            account_to_tag[str(row['Account'])] = row['Report Description']
+    row_num = 2  # Start from row 2 (after header)
+    while True:
+        account = account_sheet[f"{account_col}{row_num}"].value
+        tag = account_sheet[f"{report_col}{row_num}"].value
+        
+        # Stop when we hit a blank row
+        if account is None:
+            break
+        
+        if account and tag:
+            account_to_tag[str(account)] = tag
+        
+        row_num += 1
     
     update_status(f"Found {len(account_to_tag)} account to tag mappings")
     
-    # Create period to month mapping from Reference Mapping
-    # First, find the header row in Reference Mapping
+    # Get Reference Mapping data for period to month
+    ref_sheet = workbook["Reference Mapping"]
+    
+    # Find headers in Reference Mapping - note: the sheet structure is offset, starting at row 2
+    actual_month_col = None
+    xav_month_col = None
+    
+    # Check row 2 for headers
+    for cell in ref_sheet[2]:
+        if cell.value == "Actual Month":
+            actual_month_col = cell.column_letter
+        elif cell.value == "Current XAV Month":
+            xav_month_col = cell.column_letter
+    
+    if not all([actual_month_col, xav_month_col]):
+        raise ValueError("Could not find all required columns in Reference Mapping sheet")
+    
+    update_status(f"Found Reference Mapping columns: Actual Month={actual_month_col}, Current XAV Month={xav_month_col}")
+    
+    # Read period to month mapping
     period_to_month = {}
-    for i, row in ref_mapping_raw.iterrows():
-        if row.get(5) is not None and row.get(1) is not None:
-            if not pd.isna(row[5]) and not pd.isna(row[1]):
-                period_to_month[row[5]] = row[1]
+    row_num = 3  # Start from row 3 (after header)
+    while True:
+        actual_month = ref_sheet[f"{actual_month_col}{row_num}"].value
+        xav_month = ref_sheet[f"{xav_month_col}{row_num}"].value
+        
+        # Stop when we hit a blank row
+        if actual_month is None and xav_month is None:
+            break
+        
+        if actual_month and xav_month:
+            period_to_month[xav_month] = actual_month
+        
+        row_num += 1
     
     update_status(f"Found {len(period_to_month)} period to month mappings")
     
-    # Create Report Description to Future Tag mapping
+    # Find Report to Future Tag mapping
+    # The structure shows this is in Reference Mapping around row 16
+    mapping_found = False
     tag_to_future_tag = {}
     
-    # Find the section with "Account Mapping" and "FUTURE" headers
-    for i, row in ref_mapping_raw.iterrows():
-        if (row.get(1) == "Account Mapping" and row.get(2) == "FUTURE"):
-            # Process the rows below until we find a blank
-            j = i + 1
-            while j < len(ref_mapping_raw) and not pd.isna(ref_mapping_raw.iloc[j, 1]):
-                tag_to_future_tag[ref_mapping_raw.iloc[j, 1]] = ref_mapping_raw.iloc[j, 2]
-                j += 1
+    # Scan the entire Reference Mapping sheet for the section
+    for row_num in range(1, ref_sheet.max_row + 1):
+        # Look for the "Account Mapping" and "FUTURE" headers
+        cell_account = ref_sheet.cell(row=row_num, column=3).value
+        cell_future = ref_sheet.cell(row=row_num, column=4).value
+        
+        if cell_account == "Account Mapping" and cell_future == "FUTURE":
+            mapping_found = True
+            # Start reading from the next row
+            row_num += 1
+            
+            # Read mappings until blank row
+            while row_num <= ref_sheet.max_row:
+                tag = ref_sheet.cell(row=row_num, column=3).value
+                future_tag = ref_sheet.cell(row=row_num, column=4).value
+                
+                if tag is None or future_tag is None:
+                    break
+                
+                tag_to_future_tag[tag] = future_tag
+                row_num += 1
+            
             break
+    
+    if not mapping_found:
+        update_status("WARNING: Could not find 'Account Mapping' to 'FUTURE' mapping section")
     
     update_status(f"Found {len(tag_to_future_tag)} tag to future tag mappings")
     
@@ -98,14 +211,15 @@ def process_xav_data(input_file, output_file=None, status_callback=None):
     processed_data = []
     unmapped_accounts = []
     
-    for _, row in xav_data.iterrows():
-        account = str(row['Nat Account']) if not pd.isna(row.get('Nat Account')) else None
-        cc = str(row['CC']) if not pd.isna(row.get('CC')) else None
-        period = row['Period'] if not pd.isna(row.get('Period')) else None
-        amount = float(row['Amount']) if not pd.isna(row.get('Amount')) else 0
+    # Filter by selected periods if specified
+    for row in xav_data:
+        account = row["Nat Account"]
+        cc = row["CC"]
+        period = row["Period"]
+        amount = row["Amount"]
         
-        # Skip rows with missing required fields
-        if not all([account, cc, period]):
+        # Skip if this period is not selected (if selection is provided)
+        if selected_periods is not None and period not in selected_periods:
             continue
         
         # Check if account mapping exists
@@ -138,71 +252,112 @@ def process_xav_data(input_file, output_file=None, status_callback=None):
     # STEP 4: Aggregate data by CC, tag, and month
     update_status("Aggregating data...")
     
-    # Convert to DataFrame for easier aggregation
-    df_processed = pd.DataFrame(processed_data)
-    
     # Group by CC, tag, and month and sum the amounts
-    df_aggregated = df_processed.groupby(['cc', 'tag', 'month'])['amount'].sum().reset_index()
+    aggregated_data = {}
     
-    # STEP 5: Format data for FUTURE sheet
-    update_status("Formatting data for FUTURE sheet...")
+    for row in processed_data:
+        key = (row['cc'], row['tag'], row['month'])
+        if key not in aggregated_data:
+            aggregated_data[key] = 0
+        aggregated_data[key] += row['amount']
     
-    # Get the FUTURE sheet structure
+    # STEP 5: SCAN the FUTURE sheet to understand its structure
+    update_status("Scanning FUTURE sheet structure...")
+    
     future_sheet = workbook["FUTURE"]
     
-    # Extract the months from the first row
+    # Scan for CCs in column C (the only fixed structure requirement)
+    cc_rows = {}  # Maps CC to its row number
+    cc_sections = {}  # Maps CC to its section (start row, end row)
+    
+    # Look through all rows for numeric values in column C
+    for row_num in range(1, future_sheet.max_row + 1):
+        cc_value = future_sheet.cell(row=row_num, column=3).value
+        
+        # Check if the value is a number (could be int or float)
+        if cc_value is not None and isinstance(cc_value, (int, float)) and not isinstance(cc_value, str):
+            # Look at cells to the right to confirm it's a header row (usually contains month names)
+            has_data_to_right = False
+            for col_num in range(4, min(future_sheet.max_column + 1, 15)):  # Check up to 10 columns to the right
+                if future_sheet.cell(row=row_num, column=col_num).value:
+                    has_data_to_right = True
+                    break
+            
+            if has_data_to_right:
+                cc_rows[str(int(cc_value))] = row_num
+    
+    update_status(f"Found {len(cc_rows)} cost centers in FUTURE sheet")
+    
+    # For each CC, scan for tag rows and months
+    future_structure = {}
     future_months = []
-    for cell in future_sheet[1][3:]:  # Start from column D (index 3)
-        if cell.value:
-            future_months.append(cell.value)
+    
+    for cc, row_num in cc_rows.items():
+        # First, find all months in the header row
+        month_cols = {}  # Maps month to its column number
+        col_num = 4  # Start from column D
+        blank_count = 0
+        
+        while col_num <= future_sheet.max_column and blank_count < 10:
+            month_value = future_sheet.cell(row=row_num, column=col_num).value
+            
+            if month_value is None:
+                blank_count += 1
+            else:
+                blank_count = 0  # Reset blank count when we find a value
+                if month_value != "Blabla":  # Skip Blabla columns
+                    month_cols[month_value] = col_num
+                    if month_value not in future_months:
+                        future_months.append(month_value)
+            
+            col_num += 1
+        
+        # Now scan rows below this CC for tags
+        tag_rows = []  # List of (tag, row_number) tuples
+        current_row = row_num + 1
+        blank_count = 0
+        max_blanks = 3  # Stop after 3 blank rows
+        
+        while current_row <= future_sheet.max_row and blank_count < max_blanks:
+            tag_value = future_sheet.cell(row=current_row, column=3).value
+            
+            if tag_value is None:
+                blank_count += 1
+            elif isinstance(tag_value, str):
+                # Found a tag row - must be a string and not a number
+                if not isinstance(tag_value, (int, float)) and not tag_value.isdigit():
+                    tag_rows.append((tag_value, current_row))
+                blank_count = 0  # Reset blank counter
+            
+            current_row += 1
+        
+        future_structure[cc] = {
+            "header_row": row_num,
+            "tag_rows": tag_rows,
+            "month_cols": month_cols
+        }
     
     update_status(f"Found {len(future_months)} months in FUTURE sheet")
     
-    # Prepare data for the FUTURE sheet
-    # First, reshape the aggregated data to have months as columns
-    pivot_df = df_aggregated.pivot_table(
-        index=['cc', 'tag'],
-        columns='month',
-        values='amount',
-        aggfunc='sum',
-        fill_value=""
-    ).reset_index()
+    # STEP 6: Update the FUTURE sheet based on scanned structure
+    update_status("Updating FUTURE sheet with processed data...")
     
-    # Format the data for the FUTURE sheet
-    future_rows = []
-    
-    # Group by CC
-    unique_ccs = sorted(df_processed['cc'].unique())
-    
-    for cc in unique_ccs:
-        # Add the CC header row
-        header_row = [cc, "Blabla", "Blabla"] + future_months
-        future_rows.append(header_row)
-        
-        # Get tags for this CC
-        cc_tags = sorted(df_processed[df_processed['cc'] == cc]['tag'].unique())
-        
-        # Add rows for each tag
-        for tag in cc_tags:
-            # Create the row with the tag first
-            tag_row = [tag, None, None]
-            
-            # Add amounts for each month
-            for month in future_months:
-                # Find the amount in the pivot table
-                matching_rows = pivot_df[(pivot_df['cc'] == cc) & (pivot_df['tag'] == tag)]
-                if not matching_rows.empty and month in matching_rows.columns:
-                    amount = matching_rows[month].values[0]
-                    tag_row.append(amount)
+    # For each CC section, update the values for each tag and month
+    for cc, section in future_structure.items():
+        for tag, row_num in section["tag_rows"]:
+            # Get the correct future tag if mapped
+            for month, col_num in section["month_cols"].items():
+                # Look for the aggregated value
+                key = (cc, tag, month)
+                if key in aggregated_data:
+                    value = aggregated_data[key]
+                    future_sheet.cell(row=row_num, column=col_num, value=value)
                 else:
-                    tag_row.append("")
-            
-            future_rows.append(tag_row)
-        
-        # Add an empty row after each CC section
-        future_rows.append([])
+                    # If no value found, leave as is or clear
+                    # future_sheet.cell(row=row_num, column=col_num, value="")
+                    pass
     
-    # STEP 6: Create or update the LOGS sheet structure
+    # STEP 7: Create or update the LOGS sheet structure
     
     # Ensure "LOGS >>" sheet exists (create if not)
     logs_sheet_name = "LOGS >>"
@@ -240,13 +395,13 @@ def process_xav_data(input_file, output_file=None, status_callback=None):
     future_log.cell(row=2, column=2, value="XAV to FUTURE")
     future_log.cell(row=2, column=3, value=len(processed_data))
     future_log.cell(row=2, column=4, value=len(unmapped_accounts))
-    future_log.cell(row=2, column=5, value=len(unique_ccs))
+    future_log.cell(row=2, column=5, value=len(cc_rows))
     future_log.cell(row=2, column=6, value=len(future_months))
     future_log.cell(row=2, column=7, value="Success")
     
     update_status(f"Updated {future_log_name} with processing summary")
     
-    # STEP 7: Handle unmapped accounts (create processlogFuture if needed)
+    # STEP 8: Handle unmapped accounts (create processlogFuture if needed)
     if unmapped_accounts:
         update_status("Creating processlogFuture for unmapped accounts...")
         
@@ -278,19 +433,6 @@ def process_xav_data(input_file, output_file=None, status_callback=None):
         
         update_status(f"Created {process_log_name} with {len(unmapped_accounts)} unmapped accounts")
     
-    # STEP 8: Update the FUTURE sheet
-    update_status("Updating FUTURE sheet...")
-    
-    # Clear the existing sheet
-    for row in future_sheet.iter_rows():
-        for cell in row:
-            cell.value = None
-    
-    # Add the new data
-    for row_idx, row_data in enumerate(future_rows, start=1):
-        for col_idx, value in enumerate(row_data, start=1):
-            future_sheet.cell(row=row_idx, column=col_idx, value=value)
-    
     # STEP 9: Save the workbook
     update_status(f"Saving updated workbook to {output_file}...")
     workbook.save(output_file)
@@ -303,7 +445,7 @@ class XAVProcessorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("XAV to FUTURE Processor")
-        self.root.geometry("600x500")
+        self.root.geometry("700x600")
         self.root.resizable(True, True)
         
         # Create a frame for the file selection
@@ -317,6 +459,17 @@ class XAVProcessorApp:
         ttk.Entry(file_frame, textvariable=self.file_path, width=50).grid(column=0, row=1, sticky=(tk.W, tk.E), pady=5)
         
         ttk.Button(file_frame, text="Browse...", command=self.browse_file).grid(column=1, row=1, padx=5, pady=5)
+        
+        # Period selection frame (initially hidden)
+        self.period_frame = ttk.LabelFrame(root, text="Select Periods to Update", padding="10")
+        
+        # Variable to hold selected periods
+        self.selected_periods = []
+        self.period_vars = {}  # Will hold CheckButton variables
+        self.scan_done = False
+        
+        # Add a Scan button
+        ttk.Button(file_frame, text="Scan Periods", command=self.scan_periods).grid(column=0, row=2, sticky=tk.W, pady=5)
         
         # Output file options
         output_frame = ttk.Frame(root, padding="10")
@@ -345,7 +498,7 @@ class XAVProcessorApp:
         button_frame = ttk.Frame(root, padding="10")
         button_frame.pack(fill=tk.X, padx=10, pady=0)
         
-        self.process_btn = ttk.Button(button_frame, text="Process XAV Data", command=self.process_file)
+        self.process_btn = ttk.Button(button_frame, text="Process XAV Data", command=self.process_file, state='disabled')
         self.process_btn.pack(pady=10)
         
         # Status frame
@@ -362,100 +515,4 @@ class XAVProcessorApp:
         self.status_text.configure(yscrollcommand=scrollbar.set)
         
         # Initial status
-        self.update_status("Ready to process XAV data. Please select an Excel file.")
-    
-    def browse_file(self):
-        """Open file dialog to select input file"""
-        filetypes = [("Excel files", "*.xlsx"), ("All files", "*.*")]
-        filename = filedialog.askopenfilename(title="Select XAV Excel File", filetypes=filetypes)
-        if filename:
-            self.file_path.set(filename)
-            self.update_status(f"Selected file: {filename}")
-    
-    def browse_output_file(self):
-        """Open file dialog to select output file"""
-        filetypes = [("Excel files", "*.xlsx"), ("All files", "*.*")]
-        filename = filedialog.asksaveasfilename(title="Save Processed File As", 
-                                              filetypes=filetypes, 
-                                              defaultextension=".xlsx")
-        if filename:
-            self.output_path.set(filename)
-    
-    def toggle_output_entry(self, *args):
-        """Enable/disable output file entry based on radio button selection"""
-        if not self.output_same.get():
-            self.output_entry.config(state='normal')
-            self.browse_output_btn.config(state='normal')
-        else:
-            self.output_entry.config(state='disabled')
-            self.browse_output_btn.config(state='disabled')
-    
-    def update_status(self, message):
-        """Update status text widget"""
-        self.status_text.config(state=tk.NORMAL)
-        self.status_text.insert(tk.END, f"{message}\n")
-        self.status_text.see(tk.END)
-        self.status_text.config(state=tk.DISABLED)
-        self.root.update_idletasks()
-    
-    def process_file(self):
-        """Process the selected file"""
-        input_file = self.file_path.get()
-        
-        if not input_file or not os.path.exists(input_file):
-            messagebox.showerror("Error", "Please select a valid input file.")
-            return
-        
-        # Determine output file
-        if self.output_same.get():
-            output_file = None  # Use default naming
-        else:
-            output_file = self.output_path.get()
-            if not output_file:
-                messagebox.showerror("Error", "Please specify an output file path.")
-                return
-        
-        # Clear status
-        self.status_text.config(state=tk.NORMAL)
-        self.status_text.delete(1.0, tk.END)
-        self.status_text.config(state=tk.DISABLED)
-        
-        # Disable process button during processing
-        self.process_btn.config(state='disabled')
-        
-        try:
-            output_path = process_xav_data(input_file, output_file, self.update_status)
-            messagebox.showinfo("Success", f"Processing completed successfully!\nOutput saved to: {output_path}")
-        except Exception as e:
-            self.update_status(f"ERROR: {str(e)}")
-            self.update_status(traceback.format_exc())
-            messagebox.showerror("Error", f"An error occurred: {str(e)}")
-        finally:
-            # Re-enable process button
-            self.process_btn.config(state='normal')
-
-
-def main():
-    """
-    Launch the GUI or run command line processing based on arguments
-    """
-    if len(sys.argv) > 1:
-        # Command line mode
-        input_file = sys.argv[1]
-        output_file = sys.argv[2] if len(sys.argv) > 2 else None
-        
-        try:
-            output_path = process_xav_data(input_file, output_file)
-            print(f"Output saved to: {output_path}")
-        except Exception as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-    else:
-        # GUI mode
-        root = tk.Tk()
-        app = XAVProcessorApp(root)
-        root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+        self.update_status("Ready to process XAV data. Please select an Excel file and scan for periods.")
